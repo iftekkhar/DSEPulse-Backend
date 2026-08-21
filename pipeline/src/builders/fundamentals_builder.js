@@ -1,3 +1,5 @@
+import { stageFinancialStatements } from '../db/staging_db.js';
+
 /**
  * Constructs 21-Year Annual Audited Financial Statements (FY2005-FY2025)
  */
@@ -45,4 +47,13 @@ export function build20YearAuditedStatements(symbol, baseFundamentals = {}) {
   }
 
   return statements;
+}
+
+/**
+ * Builds and stages 20-Year Audited Statements directly into the Pipeline Staging Database
+ */
+export async function stage20YearAuditedStatements(symbol, baseFundamentals = {}) {
+  const statements = build20YearAuditedStatements(symbol, baseFundamentals);
+  const count = await stageFinancialStatements(symbol, statements);
+  return { symbol, count, statements };
 }

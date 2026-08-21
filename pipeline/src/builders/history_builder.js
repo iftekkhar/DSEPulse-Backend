@@ -1,3 +1,5 @@
+import { stagePriceHistory } from '../db/staging_db.js';
+
 /**
  * Generates calibrated 20-Year (2005-2026) daily closing history for an equity symbol
  */
@@ -66,4 +68,13 @@ export function buildStock20YearHistory(symbol, baseFundamentals = {}) {
   }
 
   return points.sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+/**
+ * Builds and stages 20-Year history directly into the Pipeline Staging Database
+ */
+export async function stageStock20YearHistory(symbol, baseFundamentals = {}) {
+  const records = buildStock20YearHistory(symbol, baseFundamentals);
+  const count = await stagePriceHistory(symbol, records);
+  return { symbol, count, records };
 }

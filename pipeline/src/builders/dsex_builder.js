@@ -1,3 +1,5 @@
+import { stageDSEXHistory } from '../db/staging_db.js';
+
 /**
  * Generates continuous 20-Year (2005-2026) DSEX benchmark index trajectory with turnover and breadth
  */
@@ -59,4 +61,13 @@ export function build20YearDSEXIndex() {
   }
 
   return points.sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+/**
+ * Builds and stages 20-Year DSEX trajectory directly into the Pipeline Staging Database
+ */
+export async function stage20YearDSEXIndex() {
+  const records = build20YearDSEXIndex();
+  const count = await stageDSEXHistory(records);
+  return { count, records };
 }

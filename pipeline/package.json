@@ -5,23 +5,24 @@
   "type": "module",
   "main": "src/scheduler.js",
   "scripts": {
-    "start": "node src/scheduler.js",
+    "start": "node src/cli.js --help",
     "cli": "node src/cli.js",
-    "scrape:live": "node src/cli.js --scrape-live",
-    "scrape:audited": "node src/cli.js --scrape-audited",
+    "db:init": "node src/cli.js --init-db",
     "build:history": "node src/cli.js --build-history",
     "build:dsex": "node src/cli.js --build-dsex",
     "build:fundamentals": "node src/cli.js --build-fundamentals",
+    "scrape:audited": "node src/cli.js --scrape-audited",
     "audit": "node src/cli.js --audit",
     "test": "node src/audit/test_suite.js",
-    "sync": "node src/cli.js --sync-all"
+    "report": "node src/cli.js --report",
+    "promote:main": "node src/cli.js --promote-main"
   },
   "keywords": [
     "dse",
-    "scraper",
     "data-pipeline",
+    "historical-builder",
     "financial-audit",
-    "quantitative-finance"
+    "staging-db"
   ],
   "author": "Iftekhar Anam",
   "license": "ISC",
@@ -31,6 +32,7 @@
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
     "fs-extra": "^11.3.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "sqlite3": "^6.0.1"
   }
 }
