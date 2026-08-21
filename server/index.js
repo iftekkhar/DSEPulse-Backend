@@ -24,6 +24,7 @@ import {
   getCompanyFundamentalsHistory,
   seed20YearFromMasterExcel,
   seedFromLatestJson,
+  autoSeed20YearHistory,
   invalidateAnalysisCache,
   dbGet,
   isSqliteAvailable
@@ -951,6 +952,7 @@ async function startServer() {
   await initDB();
   try {
     await seedFromLatestJson();
+    await autoSeed20YearHistory();
     await seed20YearFromMasterExcel();
   } catch (e) {
     console.warn('[BOOT SEED NOTICE]', e.message);
