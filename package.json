@@ -1,0 +1,30 @@
+{
+  "name": "dse-pulse-backend",
+  "version": "1.0.0",
+  "description": "DSE Pulse Institutional Backend Engine & SQLite Database Server (Dhaka UTC+6)",
+  "main": "server/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "scrape:audited": "node server/scrapers/audited_eps_scraper.js",
+    "backfill:fundamentals": "node scripts/backfill_fundamentals_20y.js",
+    "backfill:dsex": "node scripts/backfill_dsex_history_20y.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.19.0",
+    "cheerio": "^1.2.0",
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "fs-extra": "^11.4.0",
+    "node-cron": "^4.6.0",
+    "sqlite3": "^6.0.1",
+    "xlsx": "^0.18.5"
+  }
+}
