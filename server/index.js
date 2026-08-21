@@ -626,6 +626,16 @@ app.get('/', (req, res) => {
   res.send(getApiExplorerHtml());
 });
 
+// Health check endpoint for cloud hosting providers (Render, Railway, Fly.io)
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    timezone: 'Asia/Dhaka'
+  });
+});
+
 // Stocks API: Strictly pull from SQLite Database only (with 15s in-memory cache)
 app.get('/api/stocks', async (req, res) => {
   try {
