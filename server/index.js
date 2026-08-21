@@ -881,26 +881,199 @@ app.get('/api/download/job3-company-fundamentals', (req, res) => {
   }
 });
 
-// Admin / Cloud DB Reseed endpoint
-app.post('/api/admin/reseed', async (req, res) => {
+// -------------------------------------------------------------
+// SECURE DATA INGESTION API (FOR DSEPULSE-PIPELINE ENGINE)
+// -------------------------------------------------------------
+const INGEST_API_KEY = process.env.INGEST_API_KEY || 'dse-pulse-internal-key-2026';
+
+function requireIngestAuth(req, res, next) {
+  const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Unauthorized: Ingestion API key required' });
+  }
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+  if (token !== INGEST_API_KEY) {
+    return res.status(403).json({ error: 'Forbidden: Invalid Ingestion API key' });
+  }
+  next();
+}
+
+// Ingest Live Market Snapshot & Closing Prices from Pipeline
+app.post('/api/ingest/live', requireIngestAuth, async (req, res) => {
+  const { stocks, marketBreadth, date } = req.body;
+  if (!stocks || !Array.isArray(stocks)) {
+    return res.status(400).json({ error: 'Payload must contain stocks array' });
+  }
   try {
-    await initDB();
-    await seedFromLatestJson();
-    await seed20YearFromMasterExcel();
-    const stocks = await getAllStocksFromDB();
-    res.json({ status: 'ok', count: stocks.length, message: `Database initialized & seeded with ${stocks.length} companies` });
+    const tradeDate = date || new Date().toISOString().slice(0, 10);
+    let closingIngested = 0;
+    for (const stock of stocks) {
+      if (stock.symbol && stock.ltp !== null && stock.ltp !== undefined) {
+        await saveDailyClosingToDB(stock.symbol, {
+          date: tradeDate,
+          close: Number(stock.ltp),
+          ycp: Number(stock.ycp || stock.ltp),
+          change: Number(stock.change || 0),
+          changePercent: Number(stock.changePercent || 0),
+          volume: Number(stock.volume || 0),
+          pe: stock.pe !== null && stock.pe !== undefined ? Number(stock.pe) : null
+        });
+        closingIngested++;
+      }
+    }
+
+    if (marketBreadth) {
+      await saveIntradayBreadthSnapshot(marketBreadth);
+      if (marketBreadth.dsexIndex) {
+        await saveDSEXDailyClosing({
+          date: tradeDate,
+          dsexIndex: marketBreadth.dsexIndex,
+          advancing: marketBreadth.advancing || 0,
+          declining: marketBreadth.declining || 0,
+          unchanged: marketBreadth.unchanged || 0,
+          turnoverMn: marketBreadth.turnoverMn || 0,
+          volume: marketBreadth.totalVolume || 0
+        });
+      }
+    }
+
+    // Update latest.json disk cache
+    const snapshot = {
+      timestamp: new Date().toISOString(),
+      date: tradeDate,
+      totalStocks: stocks.length,
+      marketBreadth: marketBreadth || null,
+      stocks: stocks
+    };
+    await fs.writeJson(LATEST_FILE, snapshot, { spaces: 2 });
+    invalidateStocksCache();
+
+    res.json({
+      status: 'success',
+      message: `Ingested ${stocks.length} live stocks & ${closingIngested} closing records`,
+      date: tradeDate
+    });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    console.error('[INGEST LIVE ERROR]', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Job: Trigger Weekly Audited EPS & Fundamentals Scraper manually
-app.post('/api/jobs/audited-eps', async (req, res) => {
+// Ingest Company Fundamentals & 20-Year Statements from Pipeline
+app.post('/api/ingest/fundamentals', requireIngestAuth, async (req, res) => {
+  const { symbol, fundamentals, statements } = req.body;
+  if (!symbol) {
+    return res.status(400).json({ error: 'symbol is required' });
+  }
   try {
-    runAuditedEPSWeeklyScraper().catch(e => console.error('[AUDITED EPS SCRAPER ERROR]', e.message));
-    res.json({ status: 'ok', message: 'Weekly Audited EPS Crawler initiated in background' });
+    const cleanSym = symbol.toUpperCase().trim();
+    if (fundamentals) {
+      await saveFundamentals({ symbol: cleanSym, ...fundamentals });
+    }
+    if (statements && Array.isArray(statements)) {
+      for (const s of statements) {
+        await dbRun(`
+          INSERT INTO fundamentals_history (
+            symbol, fiscal_year, period, eps_basic, nav_per_share, roe,
+            dividend_yield, pe_ratio, debt_to_equity, current_ratio,
+            paid_up_capital_mn, audit_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(symbol, fiscal_year) DO UPDATE SET
+            eps_basic = excluded.eps_basic,
+            nav_per_share = excluded.nav_per_share,
+            roe = excluded.roe,
+            dividend_yield = excluded.dividend_yield,
+            pe_ratio = excluded.pe_ratio,
+            debt_to_equity = excluded.debt_to_equity,
+            current_ratio = excluded.current_ratio,
+            paid_up_capital_mn = excluded.paid_up_capital_mn,
+            audit_status = excluded.audit_status
+        `, [
+          cleanSym,
+          Number(s.year || s.fiscal_year),
+          s.period || 'Annual',
+          s.eps !== undefined ? Number(s.eps) : null,
+          s.navps !== undefined ? Number(s.navps) : null,
+          s.roe !== undefined ? Number(s.roe) : null,
+          s.dividendYield !== undefined ? Number(s.dividendYield) : null,
+          s.pe !== undefined ? Number(s.pe) : null,
+          s.debtToEquity !== undefined ? Number(s.debtToEquity) : null,
+          s.currentRatio !== undefined ? Number(s.currentRatio) : null,
+          s.paidUpCapital !== undefined ? Number(s.paidUpCapital) : null,
+          s.auditStatus || 'Audited'
+        ]);
+      }
+    }
+    invalidateStocksCache();
+    res.json({
+      status: 'success',
+      symbol: cleanSym,
+      statementsCount: statements?.length || 0
+    });
   } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    console.error('[INGEST FUNDAMENTALS ERROR]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Ingest Price History Batch from Pipeline
+app.post('/api/ingest/history', requireIngestAuth, async (req, res) => {
+  const { symbol, history } = req.body;
+  if (!symbol || !Array.isArray(history)) {
+    return res.status(400).json({ error: 'symbol and history array required' });
+  }
+  try {
+    const cleanSym = symbol.toUpperCase().trim();
+    let count = 0;
+    for (const h of history) {
+      if (h.date && h.close) {
+        await saveDailyClosingToDB(cleanSym, {
+          date: h.date,
+          close: Number(h.close ?? h.ltp ?? 0),
+          ycp: Number(h.ycp ?? h.close ?? 0),
+          change: Number(h.change || 0),
+          changePercent: Number(h.changePercent || 0),
+          volume: Number(h.volume || 0),
+          pe: h.pe !== null && h.pe !== undefined ? Number(h.pe) : null
+        });
+        count++;
+      }
+    }
+    invalidateStocksCache();
+    res.json({ status: 'success', symbol: cleanSym, insertedCount: count });
+  } catch (err) {
+    console.error('[INGEST HISTORY ERROR]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Ingest Macro DSEX History Batch from Pipeline
+app.post('/api/ingest/dsex', requireIngestAuth, async (req, res) => {
+  const { records } = req.body;
+  if (!records || !Array.isArray(records)) {
+    return res.status(400).json({ error: 'records array required' });
+  }
+  try {
+    let count = 0;
+    for (const r of records) {
+      if (r.date && (r.dsexIndex || r.dsex_index)) {
+        await saveDSEXDailyClosing({
+          date: r.date,
+          dsexIndex: Number(r.dsexIndex ?? r.dsex_index),
+          advancing: Number(r.advancing || 0),
+          declining: Number(r.declining || 0),
+          unchanged: Number(r.unchanged || 0),
+          turnoverMn: Number(r.turnoverMn ?? r.total_value_mn ?? 0),
+          volume: Number(r.volume ?? r.total_volume ?? 0)
+        });
+        count++;
+      }
+    }
+    invalidateStocksCache();
+    res.json({ status: 'success', insertedCount: count });
+  } catch (err) {
+    console.error('[INGEST DSEX ERROR]', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
