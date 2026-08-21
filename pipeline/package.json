@@ -1,0 +1,36 @@
+{
+  "name": "dse-pulse-pipeline",
+  "version": "1.0.0",
+  "description": "DSEPulse Data Ingestion, Scraping, 20-Year Historical Audit & Test Engine",
+  "type": "module",
+  "main": "src/scheduler.js",
+  "scripts": {
+    "start": "node src/scheduler.js",
+    "cli": "node src/cli.js",
+    "scrape:live": "node src/cli.js --scrape-live",
+    "scrape:audited": "node src/cli.js --scrape-audited",
+    "build:history": "node src/cli.js --build-history",
+    "build:dsex": "node src/cli.js --build-dsex",
+    "build:fundamentals": "node src/cli.js --build-fundamentals",
+    "audit": "node src/cli.js --audit",
+    "test": "node src/audit/test_suite.js",
+    "sync": "node src/cli.js --sync-all"
+  },
+  "keywords": [
+    "dse",
+    "scraper",
+    "data-pipeline",
+    "financial-audit",
+    "quantitative-finance"
+  ],
+  "author": "Iftekhar Anam",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
+    "fs-extra": "^11.3.0",
+    "node-cron": "^3.0.3"
+  }
+}

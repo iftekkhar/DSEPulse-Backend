@@ -27,6 +27,7 @@ import {
   autoSeed20YearHistory,
   invalidateAnalysisCache,
   dbGet,
+  dbRun,
   isSqliteAvailable
 } from './db.js';
 import { runAuditedEPSWeeklyScraper } from './scrapers/audited_eps_scraper.js';
