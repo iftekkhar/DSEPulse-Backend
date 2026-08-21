@@ -259,7 +259,7 @@ export async function saveDailyClosingToDB(records, dateStr) {
 // 2. Fetch Daily Closing Prices Timeline for a Stock directly from SQLite (1 record per calendar day)
 export async function getHistoricalTimeline(symbol, limit = 7500) {
   const cleanSym = (symbol || '').toUpperCase().trim();
-  const rows = await dbAll(`
+  let rows = await dbAll(`
     SELECT * FROM (
       SELECT SUBSTR(date, 1, 10) as fetchedAt, close as ltp, ycp, change, change_percent as changePercent, volume, pe
       FROM price_history
@@ -269,6 +269,22 @@ export async function getHistoricalTimeline(symbol, limit = 7500) {
       LIMIT ?
     ) ORDER BY fetchedAt ASC
   `, [cleanSym, limit]);
+
+  if (!rows || rows.length < 5) {
+    const fund = await dbGet('SELECT * FROM company_fundamentals WHERE symbol = ?', [cleanSym]);
+    await seedStockHistoryOnDemand(cleanSym, fund);
+    rows = await dbAll(`
+      SELECT * FROM (
+        SELECT SUBSTR(date, 1, 10) as fetchedAt, close as ltp, ycp, change, change_percent as changePercent, volume, pe
+        FROM price_history
+        WHERE symbol = ?
+        GROUP BY SUBSTR(date, 1, 10)
+        ORDER BY date DESC
+        LIMIT ?
+      ) ORDER BY fetchedAt ASC
+    `, [cleanSym, limit]);
+  }
+
   return rows || [];
 }
 
@@ -560,12 +576,24 @@ export async function saveDSEXDailyClosing(data, dateStr) {
 
 // 5d. Get 20-Year DSEX Historical Timeline
 export async function getDSEXHistoricalTimeline(limit = 7500) {
-  return await dbAll(`
+  let rows = await dbAll(`
     SELECT date, dsex_index as dsexIndex, advancing, declining, unchanged, total_value_mn as turnoverMn, total_volume as volume
     FROM dsex_market_history
     ORDER BY date ASC
     LIMIT ?
   `, [limit]);
+
+  if (!rows || rows.length < 50) {
+    await autoSeed20YearHistory();
+    rows = await dbAll(`
+      SELECT date, dsex_index as dsexIndex, advancing, declining, unchanged, total_value_mn as turnoverMn, total_volume as volume
+      FROM dsex_market_history
+      ORDER BY date ASC
+      LIMIT ?
+    `, [limit]);
+  }
+
+  return rows || [];
 }
 
 // 5c. Fetch Complete Equities List directly from SQLite DB (Latest Audited Fundamentals + Latest Daily Closing)
