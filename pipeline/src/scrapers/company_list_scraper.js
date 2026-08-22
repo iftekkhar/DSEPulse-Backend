@@ -16,6 +16,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { initStagingDB, dbRun, dbAll, getStagingDB } from '../db/staging_db.js';
 import { fetchWithRetry, runBatched } from '../../../shared/dse_http_client.js';
+import { isScraperEnabled, scraperBlockedMessage } from '../../../shared/scraper_registry.js';
+import { DataAuditor } from '../../../shared/data_auditor.js';
+import { numOrNull } from '../../../shared/safe_number.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,7 +73,7 @@ async function fetchActiveSymbolsFromDSE() {
 
       if (!symbol || symbol.length === 0 || symbol.includes('TRADE') || symbol.length > 20) return;
 
-      const ltp = parseFloat($(cells[2]).text().trim().replace(/,/g, '')) || null;
+      const ltp = numOrNull($(cells[2]).text().trim());
       symbols.set(symbol, { symbol, ltp });
     });
   });
@@ -88,7 +91,11 @@ async function fetchCompanyDetails(symbol) {
     const res = await fetchWithRetry(url, { timeout: 20000, attempts: 3, backoffMs: 2000 });
     const $ = cheerio.load(res.data);
 
-    let name = null, sector = null, category = null, totalShares = null, faceValue = 10;
+    // No assumed face value: BDT 10 is the common case on DSE but not universal,
+    // and silently defaulting to it for any company whose real value isn't found
+    // on the page would misstate every downstream paid-up-capital/DPS derivation
+    // that reads face_value out of stg_company_list.
+    let name = null, sector = null, category = null, totalShares = null, faceValue = null;
 
     // Company name lives in an <h2>"Company Name: X" heading -- the page <title> is
     // the generic "Display Company Information | Dhaka Stock Exchange" on every
@@ -116,16 +123,16 @@ async function fetchCompanyDetails(symbol) {
         if (label === 'sector') sector = value;
         else if (label.includes('category')) category = value.charAt(0).toUpperCase() || null;
         else if (label.includes('face value') || label.includes('par value')) {
-          faceValue = parseFloat(value) || 10;
+          faceValue = numOrNull(value);
         } else if (label.includes('total share') || label.includes('outstanding securities')) {
-          totalShares = parseInt(value.replace(/,/g, '')) || null;
+          totalShares = numOrNull(value);
         }
       }
     });
 
     return { name, sector, category, face_value: faceValue, total_shares: totalShares };
   } catch {
-    return { name: null, sector: null, category: null, face_value: 10, total_shares: null };
+    return { name: null, sector: null, category: null, face_value: null, total_shares: null };
   }
 }
 
@@ -138,6 +145,10 @@ async function fetchCompanyDetails(symbol) {
  * for every symbol regardless of resume; only the detail fetch itself is skippable.
  */
 export async function scrapeCompanyList({ fetchDetails = false, resume = true } = {}) {
+  if (!isScraperEnabled('pipeline.company_list_scraper')) {
+    console.log(scraperBlockedMessage('pipeline.company_list_scraper'));
+    return { count: 0, symbols: [], blocked: true };
+  }
   await initStagingDB();
   const now = new Date().toISOString();
 
@@ -177,8 +188,19 @@ export async function scrapeCompanyList({ fetchDetails = false, resume = true } 
 
   // 5. Insert/update every active symbol (fast DB writes; no HTTP call in this loop)
   const results = [];
+  let blockedCount = 0;
   for (const { symbol, ltp } of activeSymbols) {
-    const details = detailsMap.get(symbol) || { name: null, sector: null, category: null, face_value: 10, total_shares: null };
+    const details = detailsMap.get(symbol) || { name: null, sector: null, category: null, face_value: null, total_shares: null };
+
+    // Audit gate before the INSERT -- rejects a negative/zero face_value or
+    // total_shares outright; a genuinely-unknown one is already null by this point.
+    const audit = DataAuditor.auditCompanyListRecord({ symbol, ...details });
+    if (!audit.passed) {
+      console.warn(`[CompanyList] BLOCKED ${symbol} by audit:`, audit.errors);
+      blockedCount++;
+      continue;
+    }
+    const clean = audit.cleaned;
 
     await dbRun(`
       INSERT INTO stg_company_list (symbol, name, sector, category, face_value, total_shares, market_cap_mn, is_active, fetched_at)
@@ -187,14 +209,17 @@ export async function scrapeCompanyList({ fetchDetails = false, resume = true } 
         name=COALESCE(excluded.name, stg_company_list.name),
         sector=COALESCE(excluded.sector, stg_company_list.sector),
         category=COALESCE(excluded.category, stg_company_list.category),
-        face_value=excluded.face_value,
+        face_value=COALESCE(excluded.face_value, stg_company_list.face_value),
         total_shares=COALESCE(excluded.total_shares, stg_company_list.total_shares),
         is_active=1,
         fetched_at=excluded.fetched_at
-    `, [symbol, details.name, details.sector, details.category, details.face_value, details.total_shares,
-        ltp && details.total_shares ? (ltp * details.total_shares / 1e6) : null, now]);
+    `, [clean.symbol, clean.name, clean.sector, clean.category, clean.face_value, clean.total_shares,
+        (ltp !== null && clean.total_shares !== null) ? (ltp * clean.total_shares / 1e6) : null, now]);
 
     results.push({ symbol, ...details, is_active: 1 });
+  }
+  if (blockedCount > 0) {
+    console.warn(`[CompanyList] ${blockedCount} symbol(s) blocked by audit this run.`);
   }
 
   // 4. Save active symbols to JSON file for other pipeline modules

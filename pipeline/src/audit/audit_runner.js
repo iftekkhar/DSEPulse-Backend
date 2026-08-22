@@ -1,5 +1,5 @@
 import { dbAll, dbRun, initStagingDB } from '../db/staging_db.js';
-import { DataAuditor } from './auditor.js';
+import { DataAuditor } from '../../../shared/data_auditor.js';
 
 /**
  * Executes Comprehensive Institutional Audit over all tables in the Pipeline Staging Database

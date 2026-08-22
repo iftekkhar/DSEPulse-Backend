@@ -15,6 +15,9 @@ import { initStagingDB, stagePriceBatch, stageIndexBatch, dbGet, dbAll } from '.
 import { loadActiveSymbols } from './company_list_scraper.js';
 import { invalidateSymbolAnalyticsCache } from '../builders/analytics_engine.js';
 import { fetchWithRetry, runBatched } from '../../../shared/dse_http_client.js';
+import { isScraperEnabled, scraperBlockedMessage } from '../../../shared/scraper_registry.js';
+import { DataAuditor } from '../../../shared/data_auditor.js';
+import { numOrNull } from '../../../shared/safe_number.js';
 
 const MENDELEY_CUTOFF = '2025-04-08'; // Mendeley dataset ends here
 const NARROW_WINDOW_LOOKBACK_DAYS = 3; // safety margin for late-published sessions
@@ -61,14 +64,17 @@ async function scrapeSymbolHistory(symbol, startDate = MENDELEY_CUTOFF, endDate 
       const dateRaw = cellVals[1];
       if (!dateRaw || !/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) return;
 
-      const high   = parseFloat(cellVals[4]) || null;
-      const low    = parseFloat(cellVals[5]) || null;
-      const open   = parseFloat(cellVals[6]) || null;
-      const close  = parseFloat(cellVals[7]) || parseFloat(cellVals[3]) || null;
-      const value  = parseFloat(cellVals[10]) || null;
-      const volume = parseInt(cellVals[11]) || null;
+      const high   = numOrNull(cellVals[4]);
+      const low    = numOrNull(cellVals[5]);
+      const open   = numOrNull(cellVals[6]);
+      // CLOSEP falling back to LTP is resolving which of 2 source-specific columns
+      // holds today's own close (both represent the same real quantity) -- not
+      // borrowing a different field the way `ycp ?? close` would.
+      const close  = numOrNull(cellVals[7]) ?? numOrNull(cellVals[3]);
+      const value  = numOrNull(cellVals[10]);
+      const volume = numOrNull(cellVals[11]);
 
-      if (!close || close <= 0) return;
+      if (close === null || close <= 0) return;
 
       records.push({
         symbol,
@@ -103,6 +109,10 @@ async function scrapeSymbolHistory(symbol, startDate = MENDELEY_CUTOFF, endDate 
  * start date regardless of what's already staged -- only for a deliberate full re-scrape.
  */
 export async function fillPriceGap({ symbols = null, resume = true, fullBackfill = false } = {}) {
+  if (!isScraperEnabled('pipeline.gap_scraper_price')) {
+    console.log(scraperBlockedMessage('pipeline.gap_scraper_price'));
+    return { filled: 0, blocked: true };
+  }
   await initStagingDB();
   const yesterday = getYesterday();
 
@@ -152,7 +162,21 @@ export async function fillPriceGap({ symbols = null, resume = true, fullBackfill
       processed++;
 
       if (gapRecords.length > 0) {
-        const n = await stagePriceBatch(gapRecords);
+        // Audit gate before anything reaches stagePriceBatch. auditPriceHistory's
+        // `cleaned` output is reshaped for the simpler live-ticker record shape and
+        // would drop open/high/low/value_mn/source -- so on a pass, stage the
+        // ORIGINAL full-field records for whichever dates actually survived the
+        // audit (duplicates get dropped there even on an overall pass), not
+        // `cleaned` itself.
+        const audit = DataAuditor.auditPriceHistory(symbol, gapRecords);
+        if (!audit.passed) {
+          console.error(`  [${processed}/${targetSymbols.length}] ${symbol}: BLOCKED by audit -`, audit.errors);
+          return;
+        }
+        const survivingDates = new Set(audit.cleaned.map(c => c.date));
+        const toStage = gapRecords.filter(r => survivingDates.has(r.trade_date));
+
+        const n = await stagePriceBatch(toStage);
         totalFilled += n;
         invalidateSymbolAnalyticsCache(symbol); // new prices landed -- don't serve stale cached analytics
         console.log(`  [${processed}/${targetSymbols.length}] ${symbol}: +${n} gap records (window: ${startDate} → ${yesterday})`);
@@ -171,6 +195,10 @@ export async function fillPriceGap({ symbols = null, resume = true, fullBackfill
  * Fills the DSEX index benchmark gap between the last staged index date and yesterday.
  */
 export async function fillIndexGap() {
+  if (!isScraperEnabled('pipeline.gap_scraper_index')) {
+    console.log(scraperBlockedMessage('pipeline.gap_scraper_index'));
+    return { filled: 0, blocked: true };
+  }
   await initStagingDB();
 
   // 1. Fetch recent official DSEX from recent_market_information.php
@@ -241,7 +269,18 @@ export async function fillIndexGap() {
     return { filled: 0 };
   }
 
-  const stagedCount = await stageIndexBatch(batch);
+  // Audit gate before stageIndexBatch. Same reshaping caveat as fillPriceGap:
+  // auditDSEXHistory's `cleaned` drops index_label/turnover_mn/total_volume, so
+  // stage the original full-field batch for whichever dates survive, not `cleaned`.
+  const indexAudit = DataAuditor.auditDSEXHistory(batch);
+  if (!indexAudit.passed) {
+    console.error('[IndexGap] BLOCKED by audit:', indexAudit.errors);
+    return { filled: 0, blocked: true, errors: indexAudit.errors };
+  }
+  const survivingIndexDates = new Set(indexAudit.cleaned.map(c => c.date));
+  const toStageIndex = batch.filter(r => survivingIndexDates.has(r.trade_date));
+
+  const stagedCount = await stageIndexBatch(toStageIndex);
   const stillMissing = tradingDays.length - batch.length;
   console.log(`[IndexGap] ✅ Staged ${stagedCount} real official DSEX index records. ${stillMissing} date(s) still have no real data and remain ungapped.`);
   return { filled: stagedCount };

@@ -293,6 +293,8 @@ export async function importIndexHistory() {
       let match;
       while ((match = regex.exec(rawLine)) !== null) {
         if (match.index === regex.lastIndex) regex.lastIndex++;
+        // An unmatched regex capture group is always `undefined`, never `null` --
+        // no `!== null` check needed here (unlike a data field from an API/DB row).
         cells.push(match[1] !== undefined ? match[1] : match[2]);
       }
 

@@ -397,9 +397,6 @@ export function getApiExplorerHtml() {
       <button class="tab-btn" data-endpoint="/api/fundamentals-history/:symbol" data-param="symbol" data-default="SQURPHARMA" data-type="statements">
         <span class="method">GET</span> /api/fundamentals-history/:symbol
       </button>
-      <button class="tab-btn" data-endpoint="/api/test-seed" data-type="object">
-        <span class="method">GET</span> /api/test-seed
-      </button>
     </div>
 
     <!-- Controls Bar -->
@@ -563,9 +560,9 @@ export function getApiExplorerHtml() {
           { Key: 'Symbol', Value: data.symbol },
           { Key: 'Company Name', Value: data.fullName },
           { Key: 'Current Price', Value: '৳' + (data.currentPrice || '—') },
-          { Key: 'All-Time High (ATH)', Value: '৳' + (data.ath?.price || '—') + ' (' + (data.ath?.date || '—') + ') [' + (data.ath?.drawdownPercent || 0) + '%]' },
-          { Key: 'All-Time Low (ATL)', Value: '৳' + (data.atl?.price || '—') + ' (' + (data.atl?.date || '—') + ') [+' + (data.atl?.risePercent || 0) + '%]' },
-          { Key: 'Max Drawdown', Value: (data.maxDrawdown?.percent || 0) + '% (Peak: ' + (data.maxDrawdown?.peakDate || '—') + ' → Trough: ' + (data.maxDrawdown?.troughDate || '—') + ')' },
+          { Key: 'All-Time High (ATH)', Value: '৳' + (data.ath?.price || '—') + ' (' + (data.ath?.date || '—') + ') [' + (data.ath?.drawdownPercent !== null && data.ath?.drawdownPercent !== undefined ? data.ath.drawdownPercent + '%' : '—') + ']' },
+          { Key: 'All-Time Low (ATL)', Value: '৳' + (data.atl?.price || '—') + ' (' + (data.atl?.date || '—') + ') [+' + (data.atl?.risePercent !== null && data.atl?.risePercent !== undefined ? data.atl.risePercent + '%' : '—') + ']' },
+          { Key: 'Max Drawdown', Value: (data.maxDrawdown?.percent !== null && data.maxDrawdown?.percent !== undefined ? data.maxDrawdown.percent + '%' : '—') + ' (Peak: ' + (data.maxDrawdown?.peakDate || '—') + ' → Trough: ' + (data.maxDrawdown?.troughDate || '—') + ')' },
           { Key: 'SMA 50 / 200', Value: '৳' + (data.technical?.sma50 || '—') + ' / ৳' + (data.technical?.sma200 || '—') },
           { Key: 'Trend Signal', Value: data.technical?.trendSignal || '—' },
           { Key: 'Historical Median P/E', Value: (data.valuationCorridor?.medianPe || '—') + 'x' },

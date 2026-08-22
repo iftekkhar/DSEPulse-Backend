@@ -1,7 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import ExcelJS from 'exceljs';
+import { numOrNull } from '../shared/safe_number.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -143,20 +143,6 @@ export async function initDB() {
   try { await dbRun(`ALTER TABLE company_fundamentals ADD COLUMN current_ratio REAL;`); } catch { /* column exists */ }
 
   await dbRun(`
-    CREATE TABLE IF NOT EXISTS market_breadth (
-      date TEXT PRIMARY KEY,
-      advancing INTEGER,
-      declining INTEGER,
-      unchanged INTEGER,
-      total_trades INTEGER,
-      total_volume INTEGER,
-      total_value_mn REAL,
-      dsex_index REAL,
-      updated_at TEXT DEFAULT (datetime('now'))
-    );
-  `);
-
-  await dbRun(`
     CREATE TABLE IF NOT EXISTS dsex_market_history (
       date TEXT PRIMARY KEY,
       dsex_index REAL NOT NULL,
@@ -234,8 +220,12 @@ export async function saveDailyClosingToDB(records, dateStr) {
 
     for (const r of records) {
       const symbol = (r.symbol || '').toUpperCase().trim();
-      const close = Number(r.ltp ?? r.close ?? r.closePrice ?? 0);
-      if (!symbol || close <= 0) continue;
+      // null (not 0) when none of the 3 price aliases are present, so a record
+      // with genuinely no price data is skipped for being unusable -- not because
+      // a fabricated 0 happened to fail the close <= 0 check below.
+      const closeRaw = r.ltp ?? r.close ?? r.closePrice ?? null;
+      const close = closeRaw !== null ? Number(closeRaw) : null;
+      if (!symbol || close === null || close <= 0) continue;
 
       // None of these are NOT NULL in the schema -- preserve null for anything
       // genuinely missing rather than writing a fabricated 0 (a real stock's ycp,
@@ -293,8 +283,12 @@ export async function saveSymbolHistoryBulk(symbol, records) {
 
     for (const r of records) {
       const date = r.date;
-      const close = Number(r.close ?? r.ltp ?? 0);
-      if (!date || close <= 0) continue;
+      // null (not 0) when neither alias is present -- see saveDailyClosingToDB
+      // above for why this must skip on missing data rather than fall through a
+      // fabricated 0 into the close <= 0 guard.
+      const closeRaw = r.close ?? r.ltp ?? null;
+      const close = closeRaw !== null ? Number(closeRaw) : null;
+      if (!date || close === null || close <= 0) continue;
 
       // Defaulting ycp to `close` when missing silently forces change/changePercent
       // to compute as exactly 0 (close - close) -- fabricating "no price movement"
@@ -344,17 +338,6 @@ export async function getHistoricalTimeline(symbol, limit = 7500) {
   return rows || [];
 }
 
-// 3. Fetch latest recorded daily closing record for fallback resolution
-export async function getLatestRecordedClosing(symbol) {
-  const cleanSym = (symbol || '').toUpperCase().trim();
-  return await dbGet(`
-    SELECT date, close as ltp, ycp, change, change_percent as changePercent, volume, pe
-    FROM price_history
-    WHERE symbol = ?
-    ORDER BY date DESC
-    LIMIT 1
-  `, [cleanSym]);
-}
 
 // 4. Save Single Company Fundamentals to SQLite
 // Fields that describe one specific audited fiscal period as a coherent set (EPS,
@@ -383,6 +366,15 @@ const PERIOD_COUPLED_SET_CLAUSE = `
       quarterly_disclosure = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.quarterly_disclosure ELSE COALESCE(excluded.quarterly_disclosure, company_fundamentals.quarterly_disclosure) END,
       audited_period = COALESCE(excluded.audited_period, company_fundamentals.audited_period)`;
 
+// Null-safe change detection for saveFundamentalsBulkDelta's smart-delta skip
+// logic: a plain `Number(oldVal) !== Number(newVal)` coerces null to 0, so
+// "known -> genuinely unknown" and "known -> 0" become indistinguishable.
+function valueChanged(oldVal, newVal) {
+  if (oldVal === null && newVal === null) return false;
+  if (oldVal === null || newVal === null) return true;
+  return Number(oldVal) !== Number(newVal);
+}
+
 export async function saveFundamentals(data) {
   if (!data || !data.symbol) return;
   const symbol = data.symbol.toUpperCase().trim();
@@ -407,18 +399,18 @@ export async function saveFundamentals(data) {
     data.name || null,
     data.sector || null,
     data.category || null,
-    data.epsBasic !== undefined ? data.epsBasic : (data.eps !== undefined ? data.eps : null),
-    data.epsDiluted !== undefined ? data.epsDiluted : null,
-    data.epsQuarterly !== undefined ? data.epsQuarterly : null,
-    data.navPerShare !== undefined ? data.navPerShare : null,
-    data.paidUpCapitalMn !== undefined ? data.paidUpCapitalMn : (data.paidUpCapital !== undefined ? data.paidUpCapital : null),
-    data.authorizedCapitalMn !== undefined ? data.authorizedCapitalMn : (data.authorizedCapital !== undefined ? data.authorizedCapital : null),
-    data.peBasic !== undefined ? data.peBasic : (data.pe !== undefined ? data.pe : null),
-    data.peDiluted !== undefined ? data.peDiluted : null,
-    data.peTrailing !== undefined ? data.peTrailing : null,
-    data.dividendYield !== undefined ? data.dividendYield : null,
-    data.debtToEquity !== undefined ? data.debtToEquity : null,
-    data.currentRatio !== undefined ? data.currentRatio : null,
+    numOrNull(data.epsBasic) ?? numOrNull(data.eps),
+    numOrNull(data.epsDiluted),
+    numOrNull(data.epsQuarterly),
+    numOrNull(data.navPerShare),
+    numOrNull(data.paidUpCapitalMn) ?? numOrNull(data.paidUpCapital),
+    numOrNull(data.authorizedCapitalMn) ?? numOrNull(data.authorizedCapital),
+    numOrNull(data.peBasic) ?? numOrNull(data.pe),
+    numOrNull(data.peDiluted),
+    numOrNull(data.peTrailing),
+    numOrNull(data.dividendYield),
+    numOrNull(data.debtToEquity),
+    numOrNull(data.currentRatio),
     data.auditedPeriod || null,
     data.quarterlyDisclosure || null
   ]);
@@ -461,19 +453,24 @@ export async function saveFundamentalsBulkDelta(records) {
       continue;
     }
 
-    const epsNew = r.epsBasic !== undefined ? r.epsBasic : (r.eps !== undefined ? r.eps : null);
-    const navNew = r.navPerShare !== undefined ? r.navPerShare : null;
-    const paidUpNew = r.paidUpCapitalMn !== undefined ? r.paidUpCapitalMn : (r.paidUpCapital !== undefined ? r.paidUpCapital : null);
+    const epsNew = numOrNull(r.epsBasic) ?? numOrNull(r.eps);
+    const navNew = numOrNull(r.navPerShare);
+    const paidUpNew = numOrNull(r.paidUpCapitalMn) ?? numOrNull(r.paidUpCapital);
     const periodNew = r.auditedPeriod || null;
-    const debtNew = r.debtToEquity !== undefined ? r.debtToEquity : null;
-    const crNew = r.currentRatio !== undefined ? r.currentRatio : null;
+    const debtNew = numOrNull(r.debtToEquity);
+    const crNew = numOrNull(r.currentRatio);
 
-    const epsChanged = (existing.eps_basic !== null || epsNew !== null) && Number(existing.eps_basic) !== Number(epsNew);
-    const navChanged = (existing.nav_per_share !== null || navNew !== null) && Number(existing.nav_per_share) !== Number(navNew);
-    const paidUpChanged = (existing.paid_up_capital_mn !== null || paidUpNew !== null) && Number(existing.paid_up_capital_mn) !== Number(paidUpNew);
+    // Number(null) is 0, so the old `Number(existing) !== Number(new)` comparison
+    // would read "real value -> genuinely unknown" as "value -> 0" (a real change,
+    // but the wrong one) or worse mask a real change whenever the existing value
+    // happened to already be 0. valueChanged treats null explicitly instead of
+    // coercing it through Number().
+    const epsChanged = valueChanged(existing.eps_basic, epsNew);
+    const navChanged = valueChanged(existing.nav_per_share, navNew);
+    const paidUpChanged = valueChanged(existing.paid_up_capital_mn, paidUpNew);
     const periodChanged = existing.audited_period !== periodNew;
-    const debtChanged = (existing.debt_to_equity !== null || debtNew !== null) && Number(existing.debt_to_equity) !== Number(debtNew);
-    const crChanged = (existing.current_ratio !== null || crNew !== null) && Number(existing.current_ratio) !== Number(crNew);
+    const debtChanged = valueChanged(existing.debt_to_equity, debtNew);
+    const crChanged = valueChanged(existing.current_ratio, crNew);
 
     if (epsChanged || navChanged || paidUpChanged || periodChanged || debtChanged || crChanged) {
       toUpdate.push(r);
@@ -512,18 +509,18 @@ export async function saveFundamentalsBulkDelta(records) {
         data.name || null,
         data.sector || null,
         data.category || null,
-        data.epsBasic !== undefined ? data.epsBasic : (data.eps !== undefined ? data.eps : null),
-        data.epsDiluted !== undefined ? data.epsDiluted : null,
-        data.epsQuarterly !== undefined ? data.epsQuarterly : null,
-        data.navPerShare !== undefined ? data.navPerShare : null,
-        data.paidUpCapitalMn !== undefined ? data.paidUpCapitalMn : (data.paidUpCapital !== undefined ? data.paidUpCapital : null),
-        data.authorizedCapitalMn !== undefined ? data.authorizedCapitalMn : (data.authorizedCapital !== undefined ? data.authorizedCapital : null),
-        data.peBasic !== undefined ? data.peBasic : (data.pe !== undefined ? data.pe : null),
-        data.peDiluted !== undefined ? data.peDiluted : null,
-        data.peTrailing !== undefined ? data.peTrailing : null,
-        data.dividendYield !== undefined ? data.dividendYield : null,
-        data.debtToEquity !== undefined ? data.debtToEquity : null,
-        data.currentRatio !== undefined ? data.currentRatio : null,
+        numOrNull(data.epsBasic) ?? numOrNull(data.eps),
+        numOrNull(data.epsDiluted),
+        numOrNull(data.epsQuarterly),
+        numOrNull(data.navPerShare),
+        numOrNull(data.paidUpCapitalMn) ?? numOrNull(data.paidUpCapital),
+        numOrNull(data.authorizedCapitalMn) ?? numOrNull(data.authorizedCapital),
+        numOrNull(data.peBasic) ?? numOrNull(data.pe),
+        numOrNull(data.peDiluted),
+        numOrNull(data.peTrailing),
+        numOrNull(data.dividendYield),
+        numOrNull(data.debtToEquity),
+        numOrNull(data.currentRatio),
         data.auditedPeriod || null,
         data.quarterlyDisclosure || null
       ]);
@@ -787,53 +784,6 @@ export async function getAllStocksFromDB() {
   return [];
 }
 
-// 6. Export Historical Data to Excel (.xlsx)
-export async function exportToExcel(symbolFilter = null) {
-  const workbook = new ExcelJS.Workbook();
-  workbook.creator = 'DSE Pulse Terminal';
-  workbook.created = new Date();
-
-  const sheet = workbook.addWorksheet(symbolFilter && symbolFilter !== 'ALL' ? `${symbolFilter} History` : 'DSE Historical Prices');
-
-  sheet.columns = [
-    { header: 'Trading Code', key: 'symbol', width: 16 },
-    { header: 'Date', key: 'date', width: 14 },
-    { header: 'Close Price (Tk)', key: 'close', width: 18 },
-    { header: 'YCP (Tk)', key: 'ycp', width: 14 },
-    { header: 'Change (Tk)', key: 'change', width: 14 },
-    { header: 'Change %', key: 'change_percent', width: 14 },
-    { header: 'Volume', key: 'volume', width: 16 },
-    { header: 'P/E Ratio', key: 'pe', width: 14 }
-  ];
-
-  sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  sheet.getRow(1).fill = {
-    type: 'pattern',
-    pattern: 'solid',
-    fgColor: { argb: 'FF1E293B' }
-  };
-
-  const rows = (symbolFilter && symbolFilter !== 'ALL')
-    ? await dbAll(`
-        SELECT symbol, date, close, ycp, change, change_percent, volume, pe
-        FROM price_history
-        WHERE symbol = ?
-        ORDER BY date ASC
-      `, [symbolFilter.toUpperCase().trim()])
-    : await dbAll(`
-        SELECT symbol, date, close, ycp, change, change_percent, volume, pe
-        FROM price_history
-        ORDER BY date DESC, symbol ASC
-        LIMIT 100000
-      `);
-
-  for (const r of rows) {
-    sheet.addRow(r);
-  }
-
-  return await workbook.xlsx.writeBuffer();
-}
-
 // In-Memory High-Speed Cache for Macro DSEX Trajectory (Refreshes hourly)
 let cachedDsexMap = null;
 let lastDsexFetchTime = 0;
@@ -904,7 +854,9 @@ export async function getDetailedHistoricalAnalysis(symbol) {
   }
 
   const latestRow = rows[rows.length - 1];
-  const currentPrice = Number(latestRow.ltp || 0);
+  // No `|| 0` needed: ltp here is `close as ltp` from price_history, and `close`
+  // is NOT NULL in the schema -- it can never actually be missing.
+  const currentPrice = Number(latestRow.ltp);
   const eps = fund?.eps_basic !== null && fund?.eps_basic !== undefined ? Number(fund.eps_basic) : null;
   const navps = fund?.nav_per_share !== null && fund?.nav_per_share !== undefined ? Number(fund.nav_per_share) : null;
   const currentPe = (currentPrice > 0 && eps && eps > 0) ? Number((currentPrice / eps).toFixed(2)) : (latestRow.pe || null);
@@ -925,7 +877,7 @@ export async function getDetailedHistoricalAnalysis(symbol) {
   const pricesArray = [];
 
   for (const r of rows) {
-    const p = Number(r.ltp || 0);
+    const p = Number(r.ltp); // same NOT NULL guarantee as currentPrice above
     if (p <= 0) continue;
     pricesArray.push(p);
 
@@ -1093,7 +1045,7 @@ export async function getDetailedHistoricalAnalysis(symbol) {
   const timeline = rows.map(r => ({
     date: r.date,
     price: Number(r.ltp),
-    volume: Number(r.volume || 0),
+    volume: r.volume !== null && r.volume !== undefined ? Number(r.volume) : null,
     pe: r.pe !== null ? Number(r.pe) : null,
     dsex: dsexMap.get(r.date) || null
   }));

@@ -218,6 +218,9 @@ async function main() {
     await initStagingDB();
 
     // Check Phase 1: Company List
+    // `|| 0` is safe on all 3 counts below: COUNT(*) always returns a real
+    // integer, never null -- these aren't stored/reported data, just this
+    // resume tool's own control flow for whether to skip a phase.
     const compCount = (await dbGet('SELECT COUNT(*) AS cnt FROM stg_company_list WHERE is_active = 1'))?.cnt || 0;
     if (compCount === 0) {
       console.log('🏢 [Resume] Phase 1: Fetching Active Company List from dsebd.org...');

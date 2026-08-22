@@ -1,4 +1,4 @@
-import { DataAuditor } from './auditor.js';
+import { DataAuditor } from '../../../shared/data_auditor.js';
 
 let passedTests = 0;
 let failedTests = 0;

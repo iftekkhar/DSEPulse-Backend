@@ -49,10 +49,16 @@ import * as cheerio from 'cheerio';
 import { initStagingDB, stageFundamental, dbGet, dbAll } from '../db/staging_db.js';
 import { loadActiveSymbols } from './company_list_scraper.js';
 import { fetchWithRetry, runBatched } from '../../../shared/dse_http_client.js';
+import { isScraperEnabled, scraperBlockedMessage } from '../../../shared/scraper_registry.js';
+import { DataAuditor } from '../../../shared/data_auditor.js';
+import { numOrNull } from '../../../shared/safe_number.js';
 
+// Exported (not just used internally) so shared/test_suite.js can exercise this
+// parsing logic directly against hand-crafted fixtures, without needing a live
+// HTTP round-trip to dsebd.org -- see "extensive test cases before write" policy.
 // Last non-dash numeric value within a fixed 3-cell (Original/Restated/Diluted)
 // group -- "last wins" so a Restated figure supersedes Original when both exist.
-function lastNumberInGroup(cells, startIdx) {
+export function lastNumberInGroup(cells, startIdx) {
   let val = null;
   for (let i = startIdx; i < startIdx + 3 && i < cells.length; i++) {
     const v = parseFloat(String(cells[i]).replace(/,/g, ''));
@@ -64,7 +70,7 @@ function lastNumberInGroup(cells, startIdx) {
 // Headline group first (cells[0-2]), falling back to Continuing-Operations
 // (cells[3-5]) when the headline group is entirely dashed -- the normal case for
 // any company with no discontinued operations to report separately.
-function headlineOrContinuing(cells) {
+export function headlineOrContinuing(cells) {
   return lastNumberInGroup(cells, 0) ?? lastNumberInGroup(cells, 3);
 }
 
@@ -116,8 +122,11 @@ async function scrapeCompanyFundamentals(symbol) {
       const data = cells.slice(1);
       const dividendCellRaw = data[6] ?? null;
       const pe_ratio = headlineOrContinuing(data);
-      const dividend_yield = data.length > 7 ? (parseFloat(data[7]) || null) : null;
-      const dividend_pct = dividendCellRaw !== null ? (parseFloat(dividendCellRaw) || null) : null;
+      // numOrNull, not `parseFloat(...) || null`: a dividend yield/% of exactly 0
+      // is a real, legitimate value (the company paid no dividend that year), not
+      // a sign the cell was unparseable.
+      const dividend_yield = data.length > 7 ? numOrNull(data[7]) : null;
+      const dividend_pct = dividendCellRaw !== null ? numOrNull(dividendCellRaw) : null;
       const row = getRow(fiscal_year);
       row.pe_ratio = pe_ratio;
       row.dividend_yield = dividend_yield;
@@ -132,9 +141,12 @@ async function scrapeCompanyFundamentals(symbol) {
 
   // ── Company-level lookups needed to finish deriving fields ─────────────────
   const companyRow = await dbGet('SELECT face_value, total_shares FROM stg_company_list WHERE symbol = ?', [symbol]);
-  const faceValue = companyRow?.face_value || 10;
-  const currentTotalShares = companyRow?.total_shares || null;
-  const currentPaidUpCapitalMn = currentTotalShares ? Number(((currentTotalShares * faceValue) / 1e6).toFixed(4)) : null;
+  // No assumed face value: BDT 10 is the common case but not universal, and
+  // silently assuming it for a company whose real face value isn't in
+  // stg_company_list yet would misstate its cash-DPS derivation below.
+  const faceValue = numOrNull(companyRow?.face_value);
+  const currentTotalShares = numOrNull(companyRow?.total_shares);
+  const currentPaidUpCapitalMn = (currentTotalShares !== null && faceValue !== null) ? Number(((currentTotalShares * faceValue) / 1e6).toFixed(4)) : null;
   const maxYear = Math.max(...byYear.keys());
 
   const results = [];
@@ -145,7 +157,7 @@ async function scrapeCompanyFundamentals(symbol) {
 
     // Cash DPS in BDT, derived from the disclosed cash-dividend % x face value --
     // DSE discloses dividends as a % of face value, not a BDT-per-share figure.
-    const dps = (row.dividend_pct !== undefined && row.dividend_pct !== null)
+    const dps = (row.dividend_pct !== undefined && row.dividend_pct !== null && faceValue !== null)
       ? Number(((row.dividend_pct / 100) * faceValue).toFixed(4))
       : null;
 
@@ -156,12 +168,11 @@ async function scrapeCompanyFundamentals(symbol) {
     // year_end_close: nearest real trade_date on/before Dec 31 of this fiscal year,
     // from stg_price_history (already Tier 1/2 only) -- DSE's per-year table doesn't
     // publish a year-end price itself, but we already have the real daily closes.
-    let year_end_close = null;
     const priceRow = await dbGet(
       `SELECT close FROM stg_price_history WHERE symbol = ? AND trade_date <= ? ORDER BY trade_date DESC LIMIT 1`,
       [symbol, `${fiscal_year}-12-31`]
     );
-    if (priceRow?.close) year_end_close = Number(priceRow.close);
+    const year_end_close = numOrNull(priceRow?.close);
 
     const pb_ratio = (year_end_close !== null && navps !== null && navps > 0)
       ? Number((year_end_close / navps).toFixed(3))
@@ -207,6 +218,10 @@ async function scrapeCompanyFundamentals(symbol) {
  * Rate limited to 1.5s between requests.
  */
 export async function scrapeFundamentalsForAll({ symbols = null, verbose = true, resume = true } = {}) {
+  if (!isScraperEnabled('pipeline.fundamentals_scraper')) {
+    console.log(scraperBlockedMessage('pipeline.fundamentals_scraper'));
+    return { totalDisclosures: 0, symbolsWithData: 0, symbolsWithNoData: 0, blocked: true };
+  }
   await initStagingDB();
 
   let targetSymbols = symbols || (await loadActiveSymbols());
@@ -229,6 +244,7 @@ export async function scrapeFundamentalsForAll({ symbols = null, verbose = true,
   let totalDisclosures = 0;
   let symbolsWithData = 0;
   let symbolsWithNoData = 0;
+  let totalBlockedYears = 0;
   let processed = 0;
 
   await runBatched(targetSymbols, async (symbol) => {
@@ -237,14 +253,27 @@ export async function scrapeFundamentalsForAll({ symbols = null, verbose = true,
       processed++;
 
       if (disclosures.length > 0) {
-        for (const disclosure of disclosures) {
+        // Audit gate before stageFundamental. auditFinancialStatements' `cleaned`
+        // drops rights_ratio/total_shares/year_end_close/market_cap_mn/
+        // disclosure_date (shaped for the simpler ingest-endpoint statement, not
+        // this scraper's fuller record) -- so on a pass, stage the ORIGINAL
+        // per-year disclosures for whichever fiscal years actually survived.
+        const audit = DataAuditor.auditFinancialStatements(symbol, disclosures);
+        if (audit.errors.length > 0) {
+          console.warn(`  [${processed}/${targetSymbols.length}] ${symbol}: ${audit.errors.length} year(s) BLOCKED by audit -`, audit.errors);
+        }
+        const survivingYears = new Set(audit.cleaned.map(c => c.year));
+        const toStage = disclosures.filter(d => survivingYears.has(d.fiscal_year));
+        totalBlockedYears += disclosures.length - toStage.length;
+
+        for (const disclosure of toStage) {
           await stageFundamental({ symbol, ...disclosure });
         }
-        totalDisclosures += disclosures.length;
-        symbolsWithData++;
+        totalDisclosures += toStage.length;
+        if (toStage.length > 0) symbolsWithData++;
 
         if (verbose) {
-          console.log(`  [${processed}/${targetSymbols.length}] ${symbol}: ${disclosures.length} annual disclosures staged`);
+          console.log(`  [${processed}/${targetSymbols.length}] ${symbol}: ${toStage.length} annual disclosures staged`);
         }
       } else {
         symbolsWithNoData++;
@@ -267,7 +296,8 @@ export async function scrapeFundamentalsForAll({ symbols = null, verbose = true,
   console.log(`   Symbols with disclosures:  ${symbolsWithData}`);
   console.log(`   Symbols with no data:      ${symbolsWithNoData} (bonds/MFs/new listings)`);
   console.log(`   Total disclosures staged:  ${totalDisclosures}`);
+  console.log(`   Years blocked by audit:    ${totalBlockedYears}`);
   console.log(`   Source: DSE_OFFICIAL (all data is from official company disclosures)`);
 
-  return { totalDisclosures, symbolsWithData, symbolsWithNoData };
+  return { totalDisclosures, symbolsWithData, symbolsWithNoData, totalBlockedYears };
 }

@@ -24,11 +24,12 @@ import {
   getDetailedHistoricalAnalysis,
   getCompanyFundamentalsHistory,
   invalidateAnalysisCache,
-  dbGet,
-  dbRun,
-  isSqliteAvailable
+  dbRun
 } from './db.js';
 import { runAuditedEPSWeeklyScraper, scrapeCompanyAuditedFinancials } from './scrapers/audited_eps_scraper.js';
+import { DataAuditor } from '../shared/data_auditor.js';
+import { isScraperEnabled, scraperBlockedMessage } from '../shared/scraper_registry.js';
+import { numOrNull } from '../shared/safe_number.js';
 
 let cron;
 try {
@@ -114,7 +115,7 @@ const jobStatusRegistry = {
   job4: {
     name: 'Market Breadth & Sector Index Scraper',
     schedule: 'Every 30m during Market Hours (10:00 - 15:00 BST)',
-    target: 'market_breadth (SQLite)',
+    target: 'intraday_breadth_snapshot (SQLite)',
     lastRun: null,
     status: 'Ready'
   }
@@ -309,9 +310,14 @@ export async function fetchMarketBreadthFromDSE() {
 
 // JOB 1: Official Daily Closing Prices Scraper (Saves to SQLite price_history)
 export async function runJob1ClosingPrices() {
+  if (!isScraperEnabled('server.closing_prices')) {
+    console.log(scraperBlockedMessage('server.closing_prices'));
+    jobStatusRegistry.job1.status = 'Disabled (see shared/scraper_registry.js)';
+    return { success: false, blocked: true };
+  }
   console.log('[JOB 1] Starting Official Daily Closing Prices Ingestion...');
   jobStatusRegistry.job1.status = 'Running';
-  
+
   try {
     const records = await fetchDSEClosingPrices();
     if (records.length === 0) {
@@ -326,45 +332,82 @@ export async function runJob1ClosingPrices() {
     const enrichedRecords = records.map(r => {
       const fund = fundamentalsMap[r.symbol] || {};
       const eps = fund.eps !== null && fund.eps > 0 ? Number(fund.eps) : null;
-      const dailyPe = eps ? Number((r.close / eps).toFixed(2)) : (fund.peBasic || null);
+      const dailyPe = eps ? Number((r.close / eps).toFixed(2)) : (fund.peBasic ?? null);
       return {
         ...r,
         pe: dailyPe
       };
     });
 
-    const savedCount = await saveDailyClosingToDB(enrichedRecords, todayDhakaStr);
+    // Audit gate: nothing reaches saveDailyClosingToDB without passing this first.
+    const priceAudit = DataAuditor.auditPriceHistory('JOB1_CLOSING_PRICES', enrichedRecords);
+    if (!priceAudit.passed) {
+      jobStatusRegistry.job1.status = `Blocked by audit: ${priceAudit.errors.length} errors`;
+      console.error('[JOB 1] BLOCKED by audit:', priceAudit.errors);
+      return { success: false, error: 'Audit failed', errors: priceAudit.errors };
+    }
+
+    const savedCount = await saveDailyClosingToDB(priceAudit.cleaned, todayDhakaStr);
 
     // Compute & Append Official Daily Closing Macro Breadth & DSEX to 20-Year dsex_market_history
     let advancing = 0, declining = 0, unchanged = 0, totalVal = 0, totalVol = 0;
     for (const r of records) {
-      if (r.close > (r.ycp || r.close)) advancing++;
-      else if (r.close < (r.ycp || r.close)) declining++;
-      else unchanged++;
-      totalVal += Number(r.value || 0);
-      totalVol += Number(r.volume || 0);
+      // `r.ycp || r.close` here would compare close > close (always false) for any
+      // record with a genuinely missing ycp, silently sorting it into "unchanged"
+      // -- fabricating "no price movement" for a stock whose real prior close
+      // simply wasn't scraped. Only classify when ycp is actually known.
+      const hasYcp = r.ycp !== null && r.ycp !== undefined;
+      if (hasYcp) {
+        if (r.close > r.ycp) advancing++;
+        else if (r.close < r.ycp) declining++;
+        else unchanged++;
+      }
+      // Sum-of-possibly-missing-values for a market-wide total: an unknown
+      // per-stock value/volume contributes 0 to the aggregate (standard practice),
+      // not a fabricated 0 written into that stock's own record.
+      totalVal += numOrNull(r.value) ?? 0;
+      totalVol += numOrNull(r.volume) ?? 0;
     }
-    
+
     const liveBreadth = await fetchMarketBreadthFromDSE();
     // No hardcoded fallback numbers -- if a real value isn't available from either the
     // scraped closing records or the live breadth scrape, persist null, not a guess.
+    // totalVal/totalVol are our own real computed sums over the actually-scraped
+    // records, not a "fallback" needing arbitration against liveBreadth -- use them
+    // directly rather than the old `totalVol || liveBreadth?.totalVolume || null`
+    // chain, which could silently prefer a different source for no principled reason
+    // whenever our own (perfectly valid) sum happened to be falsy.
     const dsexClose = liveBreadth?.dsexIndex ?? null;
 
-    await saveDSEXDailyClosing({
+    // Audit gate before the DSEX/breadth write too.
+    const breadthAudit = DataAuditor.auditMarketBreadthSnapshot({
       dsexIndex: dsexClose,
       advancing,
       declining,
       unchanged,
       totalTrades: liveBreadth?.totalTrades ?? null,
-      totalVolume: totalVol || liveBreadth?.totalVolume || null,
-      totalValueMn: totalVal || liveBreadth?.totalValueMn || null
-    }, todayDhakaStr);
-    
+      totalVolume: totalVol,
+      totalValueMn: totalVal,
+    });
+    if (!breadthAudit.passed) {
+      console.error('[JOB 1] DSEX/breadth write BLOCKED by audit:', breadthAudit.errors);
+    } else {
+      await saveDSEXDailyClosing({
+        dsexIndex: breadthAudit.cleaned.dsexIndex,
+        advancing: breadthAudit.cleaned.advancing,
+        declining: breadthAudit.cleaned.declining,
+        unchanged: breadthAudit.cleaned.unchanged,
+        totalTrades: breadthAudit.cleaned.totalTrades,
+        totalVolume: totalVol,
+        totalValueMn: totalVal
+      }, todayDhakaStr);
+    }
+
     if (savedCount > 0) invalidateStocksCache();
     jobStatusRegistry.job1.lastRun = new Date().toISOString();
     jobStatusRegistry.job1.status = `Completed (${savedCount} scrips & DSEX settlement saved for ${todayDhakaStr})`;
     jobStatusRegistry.job1.recordsIngested = savedCount;
-    
+
     console.log(`[JOB 1 SUCCESS] Ingested ${savedCount} daily closing records & DSEX settlement into SQLite for ${todayDhakaStr}.`);
     return { success: true, count: savedCount, date: todayDhakaStr };
   } catch (err) {
@@ -376,6 +419,10 @@ export async function runJob1ClosingPrices() {
 
 // JOB 2: Live Intraday Ticker Sync (Session snapshot, 0 DB writes)
 export async function runJob2IntradaySync() {
+  if (!isScraperEnabled('server.live_ticker')) {
+    jobStatusRegistry.job2.status = 'Disabled (see shared/scraper_registry.js)';
+    throw Object.assign(new Error(scraperBlockedMessage('server.live_ticker')), { blocked: true });
+  }
   console.log('[JOB 2] Executing Live Intraday Ticker Sync (Session mode, 0 DB writes)...');
   jobStatusRegistry.job2.status = 'Running';
 
@@ -392,25 +439,38 @@ export async function runJob2IntradaySync() {
       const liveLtp = Number(live.ltp);
       let change = live.change !== null && live.change !== undefined && !isNaN(live.change) ? Number(live.change) : null;
       let changePercent = live.changePercent !== null && live.changePercent !== undefined && !isNaN(live.changePercent) ? Number(live.changePercent) : null;
+      // `base.ycp || liveLtp` here would default a missing stored ycp to today's
+      // own live price -- the same bug as elsewhere in this project (ltp - ltp = 0),
+      // just one hop further down the fallback chain. If neither live.ycp nor a
+      // derivable change nor a stored base.ycp is available, ycp genuinely isn't
+      // known -- stays null, and change/changePercent are left null below rather
+      // than computed against a fabricated baseline.
+      const hasBaseYcp = base.ycp !== null && base.ycp !== undefined;
       let ycp = live.ycp !== null && live.ycp !== undefined && !isNaN(live.ycp)
         ? Number(live.ycp)
-        : (change !== null ? Number((liveLtp - change).toFixed(2)) : (base.ycp || liveLtp));
+        : (change !== null ? Number((liveLtp - change).toFixed(2)) : (hasBaseYcp ? Number(base.ycp) : null));
 
-      if (change === null || isNaN(change)) {
+      if ((change === null || isNaN(change)) && ycp !== null) {
         change = Number((liveLtp - ycp).toFixed(2));
-        changePercent = ycp > 0 ? Number(((change / ycp) * 100).toFixed(2)) : 0;
+        changePercent = ycp > 0 ? Number(((change / ycp) * 100).toFixed(2)) : null;
       }
 
       // Circuit-breaker sanity check: DSE daily price band limit is +-10%
-      if (Math.abs(changePercent) > 25) {
-        if (live.change !== undefined && !isNaN(live.change)) {
+      if (changePercent !== null && Math.abs(changePercent) > 25) {
+        // `isNaN(null)` is false in JS (null coerces to 0), so the old
+        // `!== undefined && !isNaN(...)` check let a null live.change through to
+        // Number(null) -> 0, same bug class as everywhere else in this file.
+        if (live.change !== undefined && live.change !== null && !isNaN(live.change)) {
           change = Number(live.change);
           changePercent = Number(live.changePercent);
           ycp = Number((liveLtp - change).toFixed(2));
         } else {
-          ycp = liveLtp;
-          change = 0;
-          changePercent = 0;
+          // Anomalous reading with no real corroborating value to correct it against
+          // -- leave unknown rather than guessing "no change" (ycp = liveLtp was the
+          // same fabrication bug a third time).
+          ycp = null;
+          change = null;
+          changePercent = null;
         }
       }
       
@@ -446,6 +506,11 @@ export async function runJob2IntradaySync() {
 
 // JOB 3: Audited Fundamental Disclosures Crawler (Daily Smart Delta Upsert)
 export async function runJob3DailyFundamentalsDelta() {
+  if (!isScraperEnabled('server.fundamentals_delta')) {
+    console.log(scraperBlockedMessage('server.fundamentals_delta'));
+    jobStatusRegistry.job3.status = 'Disabled (see shared/scraper_registry.js)';
+    return { success: false, blocked: true };
+  }
   console.log('[JOB 3] Starting Daily Audited Fundamentals Smart Delta Ingestion...');
   jobStatusRegistry.job3.status = 'Running';
 
@@ -454,6 +519,7 @@ export async function runJob3DailyFundamentalsDelta() {
     const concurrency = 6;
     let totalUpdated = 0;
     let totalUnchanged = 0;
+    let totalBlocked = 0;
     const allChangedSymbols = [];
 
     for (let i = 0; i < symbols.length; i += concurrency) {
@@ -465,11 +531,33 @@ export async function runJob3DailyFundamentalsDelta() {
           // scrapeCompanyAuditedFinancials already returns null when epsBasic isn't found,
           // so no separate null-check on data.epsBasic is needed here.
           const data = await scrapeCompanyAuditedFinancials(sym);
-          if (data) {
-            scrapedList.push(data);
-          } else {
+          if (!data) {
             totalUnchanged++;
+            return;
           }
+          // Audit gate: treat this one disclosure as a 1-element statement array
+          // (the auditor's per-symbol multi-year shape works fine for 1 element --
+          // duplicate-year dedup is just a no-op, the actual sanity checks apply).
+          const yearMatch = String(data.auditedPeriod || '').match(/FY(\d{4})/);
+          const year = yearMatch ? Number(yearMatch[1]) : new Date().getFullYear();
+          const audit = DataAuditor.auditFinancialStatements(sym, [{
+            year,
+            eps: data.epsBasic,
+            navps: data.navPerShare,
+            dps: null,
+            bonus_pct: null,
+            pe_ratio: data.peBasic,
+            pb_ratio: null,
+            dividend_yield: data.dividendYield,
+            paid_up_capital_mn: data.paidUpCapitalMn,
+            source: 'DSE_OFFICIAL'
+          }]);
+          if (!audit.passed) {
+            console.warn(`[JOB 3] BLOCKED ${sym} by audit:`, audit.errors);
+            totalBlocked++;
+            return;
+          }
+          scrapedList.push(data);
         } catch {
           // Keep resilient
         }
@@ -486,11 +574,11 @@ export async function runJob3DailyFundamentalsDelta() {
     }
 
     jobStatusRegistry.job3.lastRun = new Date().toISOString();
-    jobStatusRegistry.job3.status = `Completed (${totalUpdated} updated, ${totalUnchanged} untouched)`;
+    jobStatusRegistry.job3.status = `Completed (${totalUpdated} updated, ${totalUnchanged} untouched, ${totalBlocked} blocked by audit)`;
     jobStatusRegistry.job3.updatedCount = totalUpdated;
     jobStatusRegistry.job3.skippedCount = totalUnchanged;
 
-    console.log(`[JOB 3 SUCCESS] Completed Fundamentals Delta: ${totalUpdated} updated, ${totalUnchanged} skipped (identical).`);
+    console.log(`[JOB 3 SUCCESS] Completed Fundamentals Delta: ${totalUpdated} updated, ${totalUnchanged} skipped (identical), ${totalBlocked} blocked by audit.`);
     return { success: true, updatedCount: totalUpdated, skippedCount: totalUnchanged, changedSymbols: allChangedSymbols };
   } catch (err) {
     jobStatusRegistry.job3.status = `Failed: ${err.message}`;
@@ -501,17 +589,28 @@ export async function runJob3DailyFundamentalsDelta() {
 
 // JOB 4: Market Breadth & Sector Index Scraper (Saves ONLY to dedicated intraday_breadth_snapshot table)
 export async function runJob4MarketBreadth() {
+  if (!isScraperEnabled('server.market_breadth')) {
+    console.log(scraperBlockedMessage('server.market_breadth'));
+    jobStatusRegistry.job4.status = 'Disabled (see shared/scraper_registry.js)';
+    return { success: false, blocked: true };
+  }
   console.log('[JOB 4] Ingesting Market Breadth 30-Min Snapshot...');
   jobStatusRegistry.job4.status = 'Running';
 
   try {
     const breadth = await fetchMarketBreadthFromDSE();
     if (breadth) {
-      await saveIntradayBreadthSnapshot(breadth);
+      const audit = DataAuditor.auditMarketBreadthSnapshot(breadth);
+      if (!audit.passed) {
+        jobStatusRegistry.job4.status = `Blocked by audit: ${audit.errors.join('; ')}`;
+        console.error('[JOB 4] BLOCKED by audit:', audit.errors);
+        return { success: false, error: 'Audit failed', errors: audit.errors };
+      }
+      await saveIntradayBreadthSnapshot(audit.cleaned);
       jobStatusRegistry.job4.lastRun = new Date().toISOString();
-      jobStatusRegistry.job4.status = `Completed (DSEX: ${breadth.dsexIndex || 'N/A'}, Adv: ${breadth.advancing}, Dec: ${breadth.declining})`;
+      jobStatusRegistry.job4.status = `Completed (DSEX: ${audit.cleaned.dsexIndex ?? 'N/A'}, Adv: ${audit.cleaned.advancing}, Dec: ${audit.cleaned.declining})`;
       console.log(`[JOB 4 SUCCESS] 30-min Intraday snapshot recorded into intraday_breadth_snapshot.`);
-      return { success: true, data: breadth };
+      return { success: true, data: audit.cleaned };
     }
     jobStatusRegistry.job4.status = 'No breadth data extracted';
     return { success: false };
@@ -591,34 +690,6 @@ app.get('/api/stocks', async (req, res) => {
   }
 });
 
-// Job 2: Manual Live Intraday Ticker Sync (Session snapshot, 0 DB writes)
-app.get('/api/test-seed', async (req, res) => {
-  let sqliteLoadError = null;
-  try {
-    const sqliteMod = await import('sqlite3');
-  } catch (e) {
-    sqliteLoadError = { message: e.message, stack: e.stack };
-  }
-
-  try {
-    const EXCEL_PATH = path.join(DATA_DIR, 'DSE_20_Year_Master_Dataset_2005_2026.xlsx');
-    const exists = fs.existsSync(EXCEL_PATH);
-    const dbRows = await dbGet('SELECT COUNT(*) as total FROM price_history').catch(e => ({ error: e.message }));
-    const fundRows = await dbGet('SELECT COUNT(*) as total FROM company_fundamentals').catch(e => ({ error: e.message }));
-    res.json({
-      nodeVersion: process.version,
-      architecture: process.arch,
-      excelExists: exists,
-      excelSize: exists ? fs.statSync(EXCEL_PATH).size : 0,
-      priceHistoryCount: dbRows ? (dbRows.total ?? dbRows.error) : 0,
-      fundamentalsCount: fundRows ? (fundRows.total ?? fundRows.error) : 0,
-      isSqliteAvailable,
-      sqliteLoadError
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack, sqliteLoadError });
-  }
-});
 
 app.post('/api/scrape', async (req, res) => {
   try {
@@ -918,14 +989,18 @@ app.post('/api/ingest/fundamentals', requireIngestAuth, async (req, res) => {
           cleanSym,
           Number(s.year || s.fiscal_year),
           s.period || 'Annual',
-          s.eps !== undefined ? Number(s.eps) : null,
-          s.navps !== undefined ? Number(s.navps) : null,
-          s.roe !== undefined ? Number(s.roe) : null,
-          s.dividendYield !== undefined ? Number(s.dividendYield) : null,
-          s.pe !== undefined ? Number(s.pe) : null,
-          s.debtToEquity !== undefined ? Number(s.debtToEquity) : null,
-          s.currentRatio !== undefined ? Number(s.currentRatio) : null,
-          s.paidUpCapital !== undefined ? Number(s.paidUpCapital) : null,
+          // `!== undefined` alone is NOT a null check -- Number(null) is 0, so a
+          // genuinely null field (undisclosed) was silently written as a fabricated
+          // "confirmed zero" P/E, paid-up capital, ROE, etc. for every one of these
+          // 8 fields. Must check both.
+          s.eps !== undefined && s.eps !== null ? Number(s.eps) : null,
+          s.navps !== undefined && s.navps !== null ? Number(s.navps) : null,
+          s.roe !== undefined && s.roe !== null ? Number(s.roe) : null,
+          s.dividendYield !== undefined && s.dividendYield !== null ? Number(s.dividendYield) : null,
+          s.pe !== undefined && s.pe !== null ? Number(s.pe) : null,
+          s.debtToEquity !== undefined && s.debtToEquity !== null ? Number(s.debtToEquity) : null,
+          s.currentRatio !== undefined && s.currentRatio !== null ? Number(s.currentRatio) : null,
+          s.paidUpCapital !== undefined && s.paidUpCapital !== null ? Number(s.paidUpCapital) : null,
           // Never default an unspecified audit status to 'Audited' -- that's a
           // verification claim, not a structural label, and asserting it by
           // default would falsely certify data whose provenance wasn't stated.

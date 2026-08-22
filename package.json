@@ -12,7 +12,11 @@
     "pipeline": "npm --prefix pipeline start",
     "pipeline:audit": "npm --prefix pipeline run audit",
     "pipeline:report": "npm --prefix pipeline run report",
-    "scrape:audited": "node server/scrapers/audited_eps_scraper.js"
+    "scrape:audited": "node server/scrapers/audited_eps_scraper.js",
+    "audit:main-db": "node server/audit/db_auditor.js",
+    "audit:code": "node shared/code_audit.js",
+    "audit:all": "npm run audit:code && npm run pipeline:audit && npm run audit:main-db",
+    "test": "node shared/test_suite.js"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -23,11 +27,9 @@
     "compression": "^1.8.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "fs-extra": "^11.4.0",
     "node-cron": "^4.6.0",
-    "sqlite3": "^6.0.1",
-    "xlsx": "^0.18.5"
+    "sqlite3": "^6.0.1"
   }
 }

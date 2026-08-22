@@ -2,6 +2,8 @@ import axios from 'axios';
 import https from 'https';
 import * as cheerio from 'cheerio';
 import { dbAll, saveFundamentalsBulkDelta } from '../db.js';
+import { DataAuditor } from '../../shared/data_auditor.js';
+import { isScraperEnabled, scraperBlockedMessage } from '../../shared/scraper_registry.js';
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
@@ -166,6 +168,10 @@ export async function scrapeCompanyAuditedFinancials(symbol) {
  * Performs fast batch smart delta checks - only writes to SQLite when a value has genuinely changed.
  */
 export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
+  if (!isScraperEnabled('server.fundamentals_weekly')) {
+    console.log(scraperBlockedMessage('server.fundamentals_weekly'));
+    return { success: false, blocked: true };
+  }
   const startTime = Date.now();
   console.log('\n======================================================');
   console.log('  🔍 Starting Weekly Audited EPS & Fundamentals Crawler');
@@ -179,6 +185,7 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
   let totalUpdated = 0;
   let totalUnchanged = 0;
   let totalFailed = 0;
+  let totalBlocked = 0;
   const allUpdatedSymbols = [];
 
   // Batch execution with concurrency control and bulk delta saving
@@ -189,11 +196,33 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
     await Promise.all(batch.map(async (sym) => {
       try {
         const scraped = await scrapeCompanyAuditedFinancials(sym);
-        if (scraped && scraped.epsBasic !== null) {
-          scrapedRecords.push(scraped);
-        } else {
+        if (!scraped || scraped.epsBasic === null) {
           totalUnchanged++;
+          return;
         }
+        // Audit gate before this reaches saveFundamentalsBulkDelta -- same
+        // 1-element-statements-array pattern used in server/index.js's Job 3
+        // (this scraper feeds the same table via the same delta-save function).
+        const yearMatch = String(scraped.auditedPeriod || '').match(/FY(\d{4})/);
+        const year = yearMatch ? Number(yearMatch[1]) : new Date().getFullYear();
+        const audit = DataAuditor.auditFinancialStatements(sym, [{
+          year,
+          eps: scraped.epsBasic,
+          navps: scraped.navPerShare,
+          dps: null,
+          bonus_pct: null,
+          pe_ratio: scraped.peBasic,
+          pb_ratio: null,
+          dividend_yield: scraped.dividendYield,
+          paid_up_capital_mn: scraped.paidUpCapitalMn,
+          source: 'DSE_OFFICIAL'
+        }]);
+        if (!audit.passed) {
+          console.warn(`[AUDITED SCRAPER] BLOCKED ${sym} by audit:`, audit.errors);
+          totalBlocked++;
+          return;
+        }
+        scrapedRecords.push(scraped);
       } catch {
         totalFailed++;
       }
@@ -217,7 +246,7 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
   const durationSeconds = Number(((Date.now() - startTime) / 1000).toFixed(2));
   console.log('======================================================');
   console.log(`[AUDITED SCRAPER] Completed in ${durationSeconds}s`);
-  console.log(`[AUDITED SCRAPER] Checked: ${symbols.length} | Updated: ${totalUpdated} | Unchanged: ${totalUnchanged} | Errors: ${totalFailed}`);
+  console.log(`[AUDITED SCRAPER] Checked: ${symbols.length} | Updated: ${totalUpdated} | Unchanged: ${totalUnchanged} | Blocked: ${totalBlocked} | Errors: ${totalFailed}`);
   console.log('======================================================\n');
 
   return {
@@ -225,6 +254,7 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
     totalChecked: symbols.length,
     updated: totalUpdated,
     unchanged: totalUnchanged,
+    blocked: totalBlocked,
     failed: totalFailed,
     durationSeconds,
     updatedSymbols: allUpdatedSymbols

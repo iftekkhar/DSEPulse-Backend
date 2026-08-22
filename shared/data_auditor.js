@@ -1,6 +1,11 @@
 /**
- * Institutional Data Auditor & Sanity Validator for DSEPulse Data Pipeline
+ * Institutional Data Auditor & Sanity Validator -- shared by both the Pipeline
+ * Staging DB gate (pipeline/src/audit/audit_runner.js) and every direct-to-main-DB
+ * write path in server/index.js (Job 1/3/4, live sync). One validator, one set of
+ * thresholds, used before every DB write in this project -- not a pipeline-only
+ * concept that server/ writes bypass.
  */
+import { numOrNull, positiveNumOrNull, deriveOrNull, roundOrNull } from './safe_number.js';
 
 export class DataAuditor {
   /**
@@ -28,7 +33,7 @@ export class DataAuditor {
     for (let i = 0; i < sorted.length; i++) {
       const r = sorted[i];
       const dStr = String(r.trade_date || r.date || r.fetchedAt || '').slice(0, 10);
-      const close = Number(r.close ?? r.ltp ?? 0);
+      const close = numOrNull(r.close ?? r.ltp) ?? 0;
 
       // Check 1: Date format validation
       if (!dStr || !/^\d{4}-\d{2}-\d{2}$/.test(dStr)) {
@@ -51,7 +56,7 @@ export class DataAuditor {
 
       // Check 4: Outlier single-day flash spike check (> 100% single session swing without corporate action)
       if (i > 0) {
-        const prevClose = Number(sorted[i - 1].close ?? sorted[i - 1].ltp ?? close);
+        const prevClose = numOrNull(sorted[i - 1].close ?? sorted[i - 1].ltp) ?? close;
         if (prevClose > 0) {
           const ratio = close / prevClose;
           if (ratio > 3.0 || ratio < 0.25) {
@@ -61,7 +66,7 @@ export class DataAuditor {
       }
 
       // Check 5: Valuation multiples sanity
-      let pe = r.pe !== null && r.pe !== undefined ? Number(r.pe) : null;
+      const pe = numOrNull(r.pe);
       if (pe !== null && (pe < 0 || pe > 300)) {
         warnings.push(`Unusual P/E on ${dStr}: ${pe}x`);
       }
@@ -69,8 +74,7 @@ export class DataAuditor {
       // No 0/close fallbacks: this project's whole sourcing policy is that a
       // genuinely unknown value stays null, never a fabricated "confirmed zero" or
       // (for ycp) a copy of today's close that would silently zero out change%.
-      const hasYcp = r.ycp !== null && r.ycp !== undefined;
-      const ycpVal = hasYcp ? Number(r.ycp) : null;
+      const ycpVal = numOrNull(r.ycp);
       cleanRecords.push({
         symbol: symbol.toUpperCase().trim(),
         date: dStr,
@@ -78,9 +82,9 @@ export class DataAuditor {
         close,
         ltp: close,
         ycp: ycpVal,
-        change: r.change !== null && r.change !== undefined ? Number(r.change) : (hasYcp && ycpVal > 0 ? Number((close - ycpVal).toFixed(2)) : null),
-        changePercent: r.changePercent !== null && r.changePercent !== undefined ? Number(r.changePercent) : (hasYcp && ycpVal > 0 ? Number((((close - ycpVal) / ycpVal) * 100).toFixed(2)) : null),
-        volume: r.volume !== null && r.volume !== undefined ? Number(r.volume) : null,
+        change: numOrNull(r.change) ?? deriveOrNull(close, ycpVal, (c, y) => y > 0 ? roundOrNull(c - y) : null),
+        changePercent: numOrNull(r.changePercent) ?? deriveOrNull(close, ycpVal, (c, y) => y > 0 ? roundOrNull(((c - y) / y) * 100) : null),
+        volume: numOrNull(r.volume),
         pe
       });
     }
@@ -130,15 +134,13 @@ export class DataAuditor {
       }
       seenYears.add(yr);
 
-      const eps = stmt.eps !== null && stmt.eps !== undefined ? Number(stmt.eps) : null;
-      const navps = stmt.navps !== null && stmt.navps !== undefined ? Number(stmt.navps) : null;
+      const eps = numOrNull(stmt.eps);
+      const navps = numOrNull(stmt.navps);
       // null, not a fabricated 0 -- P/E, P/B, and paid-up capital of literally 0 are
       // impossible for a real listed company, and an unstated ROE/dividend/bonus is
       // "not disclosed", not "confirmed zero". ROE is still derived from real
       // eps/navps when both are present -- that's exact arithmetic, not a guess.
-      const roe = stmt.roe !== null && stmt.roe !== undefined
-        ? Number(stmt.roe)
-        : (eps !== null && navps !== null && navps > 0 ? Number(((eps / navps) * 100).toFixed(2)) : null);
+      const roe = numOrNull(stmt.roe) ?? deriveOrNull(eps, navps, (e, n) => n > 0 ? roundOrNull((e / n) * 100) : null);
 
       if (eps !== null && (eps < -200 || eps > 1000)) {
         warnings.push(`Outlier EPS in FY${yr}: ৳${eps}`);
@@ -155,13 +157,13 @@ export class DataAuditor {
         period: stmt.period || 'Annual',
         eps,
         navps,
-        dps: stmt.dps !== null && stmt.dps !== undefined ? Number(stmt.dps) : null,
-        bonus_pct: stmt.bonus_pct !== null && stmt.bonus_pct !== undefined ? Number(stmt.bonus_pct) : null,
-        roe: roe !== null ? Number(roe.toFixed(2)) : null,
-        pe_ratio: stmt.pe_ratio !== null && stmt.pe_ratio !== undefined ? Number(stmt.pe_ratio) : null,
-        pb_ratio: stmt.pb_ratio !== null && stmt.pb_ratio !== undefined ? Number(stmt.pb_ratio) : null,
-        dividend_yield: stmt.dividend_yield !== null && stmt.dividend_yield !== undefined ? Number(stmt.dividend_yield) : null,
-        paid_up_capital_mn: stmt.paid_up_capital_mn !== null && stmt.paid_up_capital_mn !== undefined ? Number(stmt.paid_up_capital_mn) : null,
+        dps: numOrNull(stmt.dps),
+        bonus_pct: numOrNull(stmt.bonus_pct),
+        roe,
+        pe_ratio: numOrNull(stmt.pe_ratio),
+        pb_ratio: numOrNull(stmt.pb_ratio),
+        dividend_yield: numOrNull(stmt.dividend_yield),
+        paid_up_capital_mn: numOrNull(stmt.paid_up_capital_mn),
         source: stmt.source || 'DSE_OFFICIAL'
       });
     }
@@ -198,10 +200,10 @@ export class DataAuditor {
         warnings.push(`No DSEX value present for ${dStr} -- record skipped, not audited as an error`);
         continue;
       }
-      const dsex = Number(rawDsex);
+      const dsex = numOrNull(rawDsex);
 
-      if (isNaN(dsex) || dsex < 500 || dsex > 20000) {
-        errors.push(`DSEX benchmark out of realistic range on ${dStr}: ${dsex}`);
+      if (dsex === null || dsex < 500 || dsex > 20000) {
+        errors.push(`DSEX benchmark out of realistic range on ${dStr}: ${rawDsex}`);
         continue;
       }
 
@@ -212,9 +214,9 @@ export class DataAuditor {
         date: dStr,
         index_value: dsex,
         dsexIndex: dsex,
-        index_open: r.index_open !== null && r.index_open !== undefined ? Number(r.index_open) : null,
-        index_high: r.index_high !== null && r.index_high !== undefined ? Number(r.index_high) : null,
-        index_low: r.index_low !== null && r.index_low !== undefined ? Number(r.index_low) : null,
+        index_open: numOrNull(r.index_open),
+        index_high: numOrNull(r.index_high),
+        index_low: numOrNull(r.index_low),
         source: r.source || 'DSEX'
       });
     }
@@ -225,6 +227,90 @@ export class DataAuditor {
       errors,
       warnings,
       cleaned: cleanRecords.sort((a, b) => new Date(a.trade_date || a.date) - new Date(b.trade_date || b.date))
+    };
+  }
+
+  /**
+   * Audit one market-breadth / DSEX-closing snapshot (Job 1's daily close, Job 4's
+   * 30-min intraday snapshot). Previously neither write path in server/index.js
+   * ran any validation before persisting -- this is the gate for that.
+   */
+  static auditMarketBreadthSnapshot(snapshot = {}) {
+    const errors = [];
+    const warnings = [];
+
+    const dsexIndex = numOrNull(snapshot.dsexIndex ?? snapshot.dsex_index);
+    if (dsexIndex !== null && (dsexIndex < 500 || dsexIndex > 20000)) {
+      errors.push(`DSEX benchmark out of realistic range: ${dsexIndex}`);
+    }
+
+    const advancing = numOrNull(snapshot.advancing);
+    const declining = numOrNull(snapshot.declining);
+    const unchanged = numOrNull(snapshot.unchanged);
+    // The exact hardcoded output of the deleted pipeline/src/builders/dsex_builder.js
+    // fabrication generator -- a permanent regression guard, see AUDIT_RULES.md.
+    if (advancing === 180 && declining === 140 && unchanged === 60) {
+      errors.push('Breadth matches the known dsex_builder.js fabrication signature (advancing=180, declining=140, unchanged=60)');
+    }
+
+    const cleaned = {
+      dsexIndex,
+      advancing,
+      declining,
+      unchanged,
+      totalTrades: numOrNull(snapshot.totalTrades ?? snapshot.total_trades),
+      totalVolume: numOrNull(snapshot.totalVolume ?? snapshot.total_volume),
+      totalValueMn: numOrNull(snapshot.totalValueMn ?? snapshot.turnoverMn ?? snapshot.total_value_mn),
+    };
+
+    return {
+      passed: errors.length === 0,
+      errors,
+      warnings,
+      cleaned
+    };
+  }
+
+  /**
+   * Audit one company-list record (symbol, name, sector, category, face value,
+   * total shares). Different in kind from the financial-value auditors above --
+   * this is identity/classification metadata, not a time series -- but subject to
+   * the same rule: a genuinely unknown face_value/total_shares must be null, never
+   * a silently-assumed default (company_list_scraper.js used to default face value
+   * to 10 -- the common case, but not universal -- for any company whose real
+   * value wasn't found on the page).
+   */
+  static auditCompanyListRecord(record = {}) {
+    const errors = [];
+    const warnings = [];
+
+    const symbol = String(record.symbol || '').toUpperCase().trim();
+    if (!symbol) {
+      errors.push('Missing or empty symbol');
+      return { passed: false, errors, warnings, cleaned: null };
+    }
+
+    const faceValue = numOrNull(record.face_value);
+    if (faceValue !== null && faceValue <= 0) {
+      errors.push(`${symbol}: face_value must be positive, got ${faceValue}`);
+    }
+    const totalShares = numOrNull(record.total_shares);
+    if (totalShares !== null && totalShares <= 0) {
+      errors.push(`${symbol}: total_shares must be positive, got ${totalShares}`);
+    }
+
+    return {
+      passed: errors.length === 0,
+      errors,
+      warnings,
+      cleaned: {
+        symbol,
+        name: record.name || null,
+        sector: record.sector || null,
+        category: record.category || null,
+        face_value: (faceValue !== null && faceValue > 0) ? faceValue : null,
+        total_shares: (totalShares !== null && totalShares > 0) ? totalShares : null,
+      }
     };
   }
 }

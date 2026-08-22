@@ -1,6 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import https from 'https';
+import { numOrNull } from '../../../shared/safe_number.js';
 
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
@@ -32,6 +33,14 @@ export async function scrapeLiveMarketSnapshot() {
     let totalTurnoverMn = 0;
     let totalVolume = 0;
 
+    // Every column is parsed independently via the canonical numOrNull: a
+    // failed/missing parse stays null, never a copy of a different column or a
+    // hardcoded 0. The old version defaulted high/low/ycp to ltp on parse
+    // failure -- for ycp specifically, that silently fabricates a 0% change
+    // (ltp - ltp = 0), the same bug already found and fixed elsewhere in this
+    // project, just via `|| ltp` instead of `?? close`.
+    const parseNum = numOrNull;
+
     // Parse main trading table
     $('table.table-bordered tbody tr, table.shares-table tr').each((_, row) => {
       const cols = $(row).find('td').map((_, el) => $(el).text().trim()).get();
@@ -39,23 +48,29 @@ export async function scrapeLiveMarketSnapshot() {
         const symbol = cols[1]?.replace(/[^a-zA-Z0-9_-]/g, '').toUpperCase();
         if (!symbol || symbol === 'TRADING_CODE' || symbol === 'CODE') return;
 
-        const ltp = parseFloat(cols[2]?.replace(/,/g, '')) || 0;
-        const high = parseFloat(cols[3]?.replace(/,/g, '')) || ltp;
-        const low = parseFloat(cols[4]?.replace(/,/g, '')) || ltp;
-        const close = parseFloat(cols[5]?.replace(/,/g, '')) || ltp;
-        const ycp = parseFloat(cols[6]?.replace(/,/g, '')) || ltp;
-        const change = parseFloat(cols[7]?.replace(/,/g, '')) || (ltp - ycp);
-        const changePercent = ycp > 0 ? Number(((change / ycp) * 100).toFixed(2)) : 0;
-        const volume = parseInt(cols[9]?.replace(/,/g, ''), 10) || parseInt(cols[8]?.replace(/,/g, ''), 10) || 0;
-        const valueMn = parseFloat(cols[10]?.replace(/,/g, '')) || 0;
+        const ltp = parseNum(cols[2]);
+        const high = parseNum(cols[3]);
+        const low = parseNum(cols[4]);
+        const close = parseNum(cols[5]);
+        const ycp = parseNum(cols[6]);
+        const change = parseNum(cols[7]) ?? ((ltp !== null && ycp !== null) ? (ltp - ycp) : null);
+        const changePercent = (change !== null && ycp !== null && ycp > 0) ? ((change / ycp) * 100) : null;
+        const volume = parseNum(cols[9], true) ?? parseNum(cols[8], true);
+        const valueMn = parseNum(cols[10]);
 
-        if (ltp > 0) {
-          if (change > 0) advancing++;
-          else if (change < 0) declining++;
-          else unchanged++;
+        if (ltp !== null && ltp > 0) {
+          if (change !== null) {
+            if (change > 0) advancing++;
+            else if (change < 0) declining++;
+            else unchanged++;
+          }
 
-          totalTurnoverMn += valueMn;
-          totalVolume += volume;
+          // Sum-of-possibly-missing-values for a market-wide aggregate: an unknown
+          // per-stock volume/turnover contributes 0 to the total (standard
+          // aggregation practice, already established elsewhere in this project) --
+          // not the same as writing a fabricated 0 into that stock's own record.
+          totalTurnoverMn += valueMn ?? 0;
+          totalVolume += volume ?? 0;
 
           stocks.push({
             symbol,
@@ -64,10 +79,10 @@ export async function scrapeLiveMarketSnapshot() {
             low,
             close,
             ycp,
-            change: Number(change.toFixed(2)),
-            changePercent,
+            change: change !== null ? Number(change.toFixed(2)) : null,
+            changePercent: changePercent !== null ? Number(changePercent.toFixed(2)) : null,
             volume,
-            valueMn: Number(valueMn.toFixed(2)),
+            valueMn: valueMn !== null ? Number(valueMn.toFixed(2)) : null,
             tradeDate: dateStr
           });
         }

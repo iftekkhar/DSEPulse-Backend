@@ -12,6 +12,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { initStagingDB, dbAll, dbRun } from '../db/staging_db.js';
+import { isScraperEnabled, scraperBlockedMessage } from '../../../shared/scraper_registry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,7 +50,7 @@ function parseRows(html, symbol) {
       low: parseFloat(cells[COL.LOW]) || null,
       close: parseFloat(cells[COL.CLOSE]) || null,
       ycp: parseFloat(cells[COL.YCP]) || null,
-      volume: parseInt(cells[COL.VOLUME].replace(/,/g, '')) || 0,
+      volume: parseInt(cells[COL.VOLUME].replace(/,/g, '')) || null,
     });
   }
   return rows;
@@ -66,6 +67,10 @@ async function fetchSymbolArchive(symbol, fromDate, toDate, cookieHeader) {
  * Returns { compared, mismatches, missingInDb, missingInLanka, bySource }
  */
 export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', toDate = null, tolerance = 0.05 } = {}) {
+  if (!isScraperEnabled('pipeline.external_crosscheck_lankabd')) {
+    console.log(scraperBlockedMessage('pipeline.external_crosscheck_lankabd'));
+    return { blocked: true };
+  }
   await initStagingDB();
   const yesterday = toDate || new Date(Date.now() - 86400000).toISOString().slice(0, 10);
 
@@ -78,6 +83,7 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
   let totalCompared = 0;
   let missingInDb = 0;
   let missingInLanka = 0;
+  let incomparable = 0;
 
   for (let i = 0; i < symbols.length; i++) {
     const symbol = symbols[i];
@@ -102,8 +108,15 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
     for (const [date, lankaRow] of lankaMap.entries()) {
       const dbRow = dbMap.get(date);
       if (!dbRow) { missingInDb++; continue; }
+      // Treating a missing close as 0 would compute a wildly wrong diff (e.g. a
+      // real ৳55 vs an unknown-treated-as-0 close reads as a ৳55 "mismatch") --
+      // can't meaningfully compare against an unknown value, so skip instead.
+      if (dbRow.close === null || dbRow.close === undefined || lankaRow.close === null || lankaRow.close === undefined) {
+        incomparable++;
+        continue;
+      }
       totalCompared++;
-      const diff = Math.abs((dbRow.close ?? 0) - (lankaRow.close ?? 0));
+      const diff = Math.abs(dbRow.close - lankaRow.close);
       const diffPct = lankaRow.close ? (diff / lankaRow.close) * 100 : 0;
       if (diff > tolerance) {
         mismatches.push({
@@ -134,6 +147,7 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
     mismatchRate: totalCompared ? Number(((mismatches.length / totalCompared) * 100).toFixed(3)) : 0,
     missingInDb,
     missingInLanka,
+    incomparable,
     mismatchesBySource: bySource,
   };
 
