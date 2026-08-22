@@ -18,9 +18,10 @@ export function getStagingDB() {
       if (err) {
         console.error('[STAGING DB ERROR] Could not connect to staging database:', err.message);
       } else {
-        // Enable WAL mode for high concurrency in staging
         dbInstance.run('PRAGMA journal_mode = WAL;');
         dbInstance.run('PRAGMA synchronous = NORMAL;');
+        dbInstance.run('PRAGMA cache_size = -64000;'); // 64MB cache for large imports
+        dbInstance.run('PRAGMA temp_store = MEMORY;');
       }
     });
   }
@@ -58,211 +59,310 @@ export function dbAll(sql, params = []) {
 }
 
 /**
- * Initialize Staging Database Schema
+ * Run multiple statements in a single transaction (fast bulk inserts)
  */
-export async function initStagingDB() {
+export function dbTransaction(statements) {
   const db = getStagingDB();
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
+      let error = null;
+      for (const { sql, params } of statements) {
+        if (error) break;
+        db.run(sql, params || [], (err) => { if (err) error = err; });
+      }
+      db.run(error ? 'ROLLBACK' : 'COMMIT', (err) => {
+        if (error || err) reject(error || err);
+        else resolve();
+      });
+    });
+  });
+}
 
-  // 1. Staged Price History
+// ─────────────────────────────────────────────────────────────────────────────
+//  SCHEMA INITIALIZATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function initStagingDB() {
+  // ── Table 1: Canonical Active Company List ─────────────────────────────────
   await dbRun(`
-    CREATE TABLE IF NOT EXISTS stg_price_history (
-      symbol TEXT NOT NULL,
-      date TEXT NOT NULL,
-      close REAL NOT NULL,
-      ycp REAL,
-      change REAL,
-      change_percent REAL,
-      volume INTEGER,
-      pe REAL,
-      staged_at TEXT NOT NULL,
-      PRIMARY KEY (symbol, date)
+    CREATE TABLE IF NOT EXISTS stg_company_list (
+      symbol            TEXT PRIMARY KEY,
+      name              TEXT,
+      sector            TEXT,
+      category          TEXT,      -- A, B, N, Z, SME, Bond, MF
+      listing_date      TEXT,
+      face_value        REAL DEFAULT 10.0,
+      total_shares      INTEGER,
+      market_cap_mn     REAL,
+      is_active         INTEGER DEFAULT 1,  -- 1 = currently listed on DSE today
+      fetched_at        TEXT NOT NULL
     )
   `);
 
-  // 2. Staged 20-Year Audited Financial Statements
+  // ── Table 2: Full OHLCV Price History (1999–Yesterday) ────────────────────
   await dbRun(`
-    CREATE TABLE IF NOT EXISTS stg_fundamentals_history (
-      symbol TEXT NOT NULL,
-      fiscal_year INTEGER NOT NULL,
-      period TEXT DEFAULT 'Annual',
-      eps_basic REAL,
-      nav_per_share REAL,
-      roe REAL,
-      dividend_yield REAL,
-      pe_ratio REAL,
-      debt_to_equity REAL,
-      current_ratio REAL,
-      paid_up_capital_mn REAL,
-      audit_status TEXT DEFAULT 'Audited',
-      staged_at TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS stg_price_history (
+      symbol            TEXT NOT NULL,
+      trade_date        TEXT NOT NULL,   -- YYYY-MM-DD
+      open              REAL,
+      high              REAL,
+      low               REAL,
+      close             REAL NOT NULL,
+      volume            INTEGER,
+      value_mn          REAL,            -- Turnover (million BDT); NULL if not in source
+      trades            INTEGER,
+      ycp               REAL,            -- Yesterday's closing price (if available)
+      change_amt        REAL,
+      change_pct        REAL,
+      source            TEXT NOT NULL,   -- 'MENDELEY', 'DSE_SCRAPE', 'DERIVED'
+      staged_at         TEXT NOT NULL,
+      PRIMARY KEY (symbol, trade_date)
+    )
+  `);
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_price_symbol ON stg_price_history (symbol)`);
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_price_date   ON stg_price_history (trade_date)`);
+
+  // ── Table 3: Merged Index History (DGEN 1999-2012 + DSEX 2013-Today) ───────
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS stg_index_history (
+      trade_date        TEXT PRIMARY KEY,  -- YYYY-MM-DD
+      index_label       TEXT NOT NULL,     -- 'DGEN' | 'DSEX'
+      index_value       REAL NOT NULL,     -- Raw value from source
+      index_open        REAL,
+      index_high        REAL,
+      index_low         REAL,
+      total_volume      INTEGER,
+      total_value_mn    REAL,
+      market_cap_bn     REAL,
+      advancing         INTEGER,
+      declining         INTEGER,
+      unchanged         INTEGER,
+      source            TEXT NOT NULL,     -- 'MENDELEY', 'KAGGLE', 'DSE_SCRAPE'
+      staged_at         TEXT NOT NULL
+    )
+  `);
+  await dbRun(`CREATE INDEX IF NOT EXISTS idx_index_date ON stg_index_history (trade_date)`);
+
+  // ── Table 4: Annual Fundamentals — OFFICIAL/AUDITED ONLY ──────────────────
+  // Only populated from officially disclosed data on dsebd.org company pages.
+  // NEVER populated with synthetic/estimated values.
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS stg_annual_fundamentals (
+      symbol            TEXT NOT NULL,
+      fiscal_year       INTEGER NOT NULL,  -- e.g. 2024 = FY ending June 2024
+      eps               REAL,              -- Basic EPS (BDT) — from audited P&L
+      navps             REAL,              -- Net Asset Value Per Share (BDT) — audited B/S
+      dps               REAL,              -- Cash Dividend Per Share (BDT) declared
+      bonus_pct         REAL,              -- Bonus share % (e.g. 10 = 10%)
+      rights_ratio      TEXT,              -- Rights share ratio (e.g. "1R:5")
+      paid_up_capital_mn REAL,             -- Paid-up capital in million BDT
+      total_shares      INTEGER,           -- Total issued shares outstanding
+      year_end_close    REAL,              -- Closing price on last session of fiscal year
+      pe_ratio          REAL,              -- Derived: year_end_close / eps
+      pb_ratio          REAL,              -- Derived: year_end_close / navps
+      roe               REAL,              -- Derived: eps / navps * 100
+      dividend_yield    REAL,              -- Derived: dps / year_end_close * 100
+      market_cap_mn     REAL,              -- Derived: year_end_close * total_shares / 1e6
+      disclosure_date   TEXT,              -- Date the disclosure was published on DSE
+      source            TEXT NOT NULL,     -- 'DSE_OFFICIAL' only — no synthetic values
+      staged_at         TEXT NOT NULL,
       PRIMARY KEY (symbol, fiscal_year)
     )
   `);
 
-  // 3. Staged 20-Year DSEX Market History
-  await dbRun(`
-    CREATE TABLE IF NOT EXISTS stg_dsex_market_history (
-      date TEXT PRIMARY KEY,
-      dsex_index REAL NOT NULL,
-      advancing INTEGER,
-      declining INTEGER,
-      unchanged INTEGER,
-      total_value_mn REAL,
-      total_volume INTEGER,
-      staged_at TEXT NOT NULL
-    )
-  `);
+  // Technical indicators and performance summaries are computed on demand
+  // (see analytics_engine.js's getSymbolAnalytics), not pre-computed/stored here --
+  // there was no promotion destination for them in the main DB either (it already
+  // computes on the fly), so a persisted table just risked silent staleness for
+  // no benefit. stg_computed_analytics / stg_performance_summary were dropped.
 
-  // 4. Staged Company Fundamentals
-  await dbRun(`
-    CREATE TABLE IF NOT EXISTS stg_company_fundamentals (
-      symbol TEXT PRIMARY KEY,
-      name TEXT,
-      sector TEXT,
-      category TEXT,
-      eps_basic REAL,
-      nav_per_share REAL,
-      paid_up_capital_mn REAL,
-      dividend_yield REAL,
-      audited_period TEXT DEFAULT 'Annual',
-      staged_at TEXT NOT NULL
-    )
-  `);
-
-  // 5. Institutional Audit Logs Table
+  // ── Table 6: Audit Certification Logs ────────────────────────────────────
   await dbRun(`
     CREATE TABLE IF NOT EXISTS audit_reports (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_at TEXT NOT NULL,
-      target_entity TEXT NOT NULL,
-      records_audited INTEGER NOT NULL,
-      errors_count INTEGER NOT NULL,
-      warnings_count INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      report_json TEXT
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_at            TEXT NOT NULL,
+      target_entity     TEXT NOT NULL,
+      records_audited   INTEGER NOT NULL,
+      errors_count      INTEGER NOT NULL,
+      warnings_count    INTEGER NOT NULL,
+      status            TEXT NOT NULL,
+      report_json       TEXT
     )
   `);
 
-  console.log(`[STAGING DB] Dedicated Pipeline Staging Database initialized: ${STAGING_DB_PATH}`);
+  console.log(`[STAGING DB] Pipeline Staging Database initialized: ${STAGING_DB_PATH}`);
+  console.log(`[STAGING DB] Tables: stg_company_list, stg_price_history, stg_index_history,`);
+  console.log(`[STAGING DB]         stg_annual_fundamentals, audit_reports`);
 }
 
-/**
- * Stage Historical Price Batch
- */
-export async function stagePriceHistory(symbol, records = []) {
-  const cleanSym = symbol.toUpperCase().trim();
-  const now = new Date().toISOString();
+// ─────────────────────────────────────────────────────────────────────────────
+//  WRITE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Upsert a batch of price records into stg_price_history.
+ * Batches into transactions of 500 for performance.
+ */
+export async function stagePriceBatch(records = []) {
+  const now = new Date().toISOString();
+  const BATCH_SIZE = 500;
   let count = 0;
-  for (const r of records) {
-    if (r.date && (r.close !== null && r.close !== undefined)) {
-      await dbRun(`
-        INSERT INTO stg_price_history (symbol, date, close, ycp, change, change_percent, volume, pe, staged_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(symbol, date) DO UPDATE SET
-          close = excluded.close,
-          ycp = excluded.ycp,
-          change = excluded.change,
-          change_percent = excluded.change_percent,
-          volume = excluded.volume,
-          pe = excluded.pe,
-          staged_at = excluded.staged_at
-      `, [
-        cleanSym,
-        r.date,
-        Number(r.close ?? r.ltp ?? 0),
-        Number(r.ycp ?? r.close ?? 0),
-        Number(r.change || 0),
-        Number(r.changePercent || 0),
-        Number(r.volume || 0),
-        r.pe !== null && r.pe !== undefined ? Number(r.pe) : null,
-        now
-      ]);
-      count++;
-    }
+
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batch = records.slice(i, i + BATCH_SIZE);
+    const stmts = batch
+      .filter(r => r.symbol && r.trade_date && r.close != null && r.close > 0)
+      .map(r => ({
+        sql: `INSERT INTO stg_price_history
+          (symbol, trade_date, open, high, low, close, volume, value_mn, trades, ycp, change_amt, change_pct, source, staged_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(symbol, trade_date) DO UPDATE SET
+            open=excluded.open, high=excluded.high, low=excluded.low,
+            close=excluded.close, volume=excluded.volume,
+            value_mn=excluded.value_mn, ycp=excluded.ycp,
+            change_amt=excluded.change_amt, change_pct=excluded.change_pct,
+            source=excluded.source, staged_at=excluded.staged_at`,
+        params: [
+          r.symbol.toUpperCase().trim(),
+          r.trade_date,
+          r.open != null ? Number(r.open) : null,
+          r.high != null ? Number(r.high) : null,
+          r.low  != null ? Number(r.low)  : null,
+          Number(r.close),
+          r.volume != null ? parseInt(r.volume) : null,
+          r.value_mn != null ? Number(r.value_mn) : null,
+          r.trades != null ? parseInt(r.trades) : null,
+          r.ycp != null ? Number(r.ycp) : null,
+          r.change_amt != null ? Number(r.change_amt) : null,
+          r.change_pct != null ? Number(r.change_pct) : null,
+          r.source || 'UNKNOWN',
+          now,
+        ]
+      }));
+
+    await dbTransaction(stmts);
+    count += stmts.length;
   }
   return count;
 }
 
 /**
- * Stage 20-Year Audited Financial Statements
+ * Upsert index history records into stg_index_history.
  */
-export async function stageFinancialStatements(symbol, statements = []) {
-  const cleanSym = symbol.toUpperCase().trim();
+export async function stageIndexBatch(records = []) {
   const now = new Date().toISOString();
+  const BATCH_SIZE = 500;
+  let count = 0;
 
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batch = records.slice(i, i + BATCH_SIZE);
+    const stmts = batch
+      .filter(r => r.trade_date && r.index_value > 0)
+      .map(r => ({
+        sql: `INSERT INTO stg_index_history
+          (trade_date, index_label, index_value, index_open, index_high, index_low, total_volume, total_value_mn, source, staged_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(trade_date) DO UPDATE SET
+            index_value=excluded.index_value, index_open=excluded.index_open,
+            index_high=excluded.index_high, index_low=excluded.index_low,
+            total_volume=excluded.total_volume, source=excluded.source, staged_at=excluded.staged_at`,
+        params: [
+          r.trade_date,
+          r.index_label || 'DSEX',
+          Number(r.index_value),
+          r.index_open != null ? Number(r.index_open) : null,
+          r.index_high != null ? Number(r.index_high) : null,
+          r.index_low  != null ? Number(r.index_low)  : null,
+          r.total_volume != null ? parseInt(r.total_volume) : null,
+          r.total_value_mn != null ? Number(r.total_value_mn) : null,
+          r.source || 'UNKNOWN',
+          now,
+        ]
+      }));
+
+    await dbTransaction(stmts);
+    count += stmts.length;
+  }
+  return count;
+}
+
+/**
+ * Upsert company fundamentals — OFFICIAL AUDITED DATA ONLY.
+ * Source must always be 'DSE_OFFICIAL'.
+ */
+export async function stageFundamental(record) {
+  const now = new Date().toISOString();
+  await dbRun(`
+    INSERT INTO stg_annual_fundamentals
+      (symbol, fiscal_year, eps, navps, dps, bonus_pct, rights_ratio,
+       paid_up_capital_mn, total_shares, year_end_close,
+       pe_ratio, pb_ratio, roe, dividend_yield, market_cap_mn,
+       disclosure_date, source, staged_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DSE_OFFICIAL', ?)
+    ON CONFLICT(symbol, fiscal_year) DO UPDATE SET
+      eps=excluded.eps, navps=excluded.navps, dps=excluded.dps,
+      bonus_pct=excluded.bonus_pct, rights_ratio=excluded.rights_ratio,
+      paid_up_capital_mn=excluded.paid_up_capital_mn,
+      total_shares=excluded.total_shares, year_end_close=excluded.year_end_close,
+      pe_ratio=excluded.pe_ratio, pb_ratio=excluded.pb_ratio,
+      roe=excluded.roe, dividend_yield=excluded.dividend_yield,
+      market_cap_mn=excluded.market_cap_mn,
+      disclosure_date=excluded.disclosure_date, staged_at=excluded.staged_at
+  `, [
+    record.symbol.toUpperCase().trim(),
+    record.fiscal_year,
+    record.eps ?? null,
+    record.navps ?? null,
+    record.dps ?? null,
+    record.bonus_pct ?? null,
+    record.rights_ratio ?? null,
+    record.paid_up_capital_mn ?? null,
+    record.total_shares ?? null,
+    record.year_end_close ?? null,
+    record.pe_ratio ?? null,
+    record.pb_ratio ?? null,
+    record.roe ?? null,
+    record.dividend_yield ?? null,
+    record.market_cap_mn ?? null,
+    record.disclosure_date ?? null,
+    now,
+  ]);
+}
+
+// Legacy compatibility helpers (used by existing builders and audit runner)
+export async function stagePriceHistory(symbol, records = []) {
+  const mapped = records.map(r => ({ ...r, symbol, source: r.source || 'DERIVED' }));
+  return stagePriceBatch(mapped);
+}
+
+export async function stageDSEXHistory(records = []) {
+  const mapped = records.map(r => ({
+    trade_date: r.date,
+    index_label: 'DSEX',
+    index_value: r.dsexIndex ?? r.dsex_index,
+    total_volume: r.volume ?? r.total_volume,
+    total_value_mn: r.turnoverMn ?? r.total_value_mn,
+    source: r.source || 'DERIVED',
+  }));
+  return stageIndexBatch(mapped);
+}
+
+export async function stageFinancialStatements(symbol, statements = []) {
   let count = 0;
   for (const s of statements) {
     const yr = Number(s.year || s.fiscal_year);
-    if (!isNaN(yr)) {
-      await dbRun(`
-        INSERT INTO stg_fundamentals_history (
-          symbol, fiscal_year, period, eps_basic, nav_per_share, roe,
-          dividend_yield, pe_ratio, debt_to_equity, current_ratio,
-          paid_up_capital_mn, audit_status, staged_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(symbol, fiscal_year) DO UPDATE SET
-          eps_basic = excluded.eps_basic,
-          nav_per_share = excluded.nav_per_share,
-          roe = excluded.roe,
-          dividend_yield = excluded.dividend_yield,
-          pe_ratio = excluded.pe_ratio,
-          debt_to_equity = excluded.debt_to_equity,
-          current_ratio = excluded.current_ratio,
-          paid_up_capital_mn = excluded.paid_up_capital_mn,
-          audit_status = excluded.audit_status,
-          staged_at = excluded.staged_at
-      `, [
-        cleanSym,
-        yr,
-        s.period || 'Annual',
-        s.eps !== undefined ? Number(s.eps) : null,
-        s.navps !== undefined ? Number(s.navps) : null,
-        s.roe !== undefined ? Number(s.roe) : null,
-        s.dividendYield !== undefined ? Number(s.dividendYield) : null,
-        s.pe !== undefined ? Number(s.pe) : null,
-        s.debtToEquity !== undefined ? Number(s.debtToEquity) : 0.4,
-        s.currentRatio !== undefined ? Number(s.currentRatio) : 1.8,
-        s.paidUpCapital !== undefined ? Number(s.paidUpCapital) : 500,
-        s.auditStatus || 'Audited',
-        now
-      ]);
-      count++;
-    }
-  }
-  return count;
-}
-
-/**
- * Stage 20-Year DSEX Market History
- */
-export async function stageDSEXHistory(records = []) {
-  const now = new Date().toISOString();
-  let count = 0;
-  for (const r of records) {
-    if (r.date && (r.dsexIndex || r.dsex_index)) {
-      await dbRun(`
-        INSERT INTO stg_dsex_market_history (
-          date, dsex_index, advancing, declining, unchanged, total_value_mn, total_volume, staged_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(date) DO UPDATE SET
-          dsex_index = excluded.dsex_index,
-          advancing = excluded.advancing,
-          declining = excluded.declining,
-          unchanged = excluded.unchanged,
-          total_value_mn = excluded.total_value_mn,
-          total_volume = excluded.total_volume,
-          staged_at = excluded.staged_at
-      `, [
-        r.date,
-        Number(r.dsexIndex ?? r.dsex_index),
-        Number(r.advancing || 0),
-        Number(r.declining || 0),
-        Number(r.unchanged || 0),
-        Number(r.turnoverMn ?? r.total_value_mn ?? 0),
-        Number(r.volume ?? r.total_volume ?? 0),
-        now
-      ]);
+    if (!isNaN(yr) && yr > 1999 && yr <= new Date().getFullYear()) {
+      await stageFundamental({
+        symbol,
+        fiscal_year: yr,
+        eps: s.eps ?? null,
+        navps: s.navps ?? null,
+        dps: s.dps ?? null,
+        bonus_pct: s.bonus_pct ?? null,
+        paid_up_capital_mn: s.paidUpCapital ?? s.paid_up_capital_mn ?? null,
+        source: 'DSE_OFFICIAL',
+      });
       count++;
     }
   }

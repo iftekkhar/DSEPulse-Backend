@@ -3,17 +3,8 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { scrapeLiveMarketSnapshot } from './scrapers/live_scraper.js';
-import { scrapeCompanyFundamentals } from './scrapers/audited_fundamentals_scraper.js';
-import { buildStock20YearHistory } from './builders/history_builder.js';
-import { build20YearDSEXIndex } from './builders/dsex_builder.js';
-import { build20YearAuditedStatements } from './builders/fundamentals_builder.js';
 import { DataAuditor } from './audit/auditor.js';
-import {
-  publishLiveSnapshot,
-  publishCompanyFundamentals,
-  publishStockHistory,
-  publishDSEXHistory
-} from './sync/publisher.js';
+import { publishLiveSnapshot } from './sync/publisher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -68,23 +59,5 @@ cron.schedule('30 15 * * 0-4', async () => {
     }
   } catch (err) {
     console.error(`[PIPELINE ERROR] EOD Settlement failed: ${err.message}`);
-  }
-}, { timezone: DHAKA_TZ });
-
-/**
- * 3. Weekend Master 20-Year Calibration Job
- * Executes every Saturday at 10:00 BST
- */
-cron.schedule('0 10 * * 6', async () => {
-  console.log(`[PIPELINE] [${new Date().toLocaleTimeString('en-US', { timeZone: DHAKA_TZ })}] Running Weekend Master 20-Year Calibration...`);
-  try {
-    const dsex = build20YearDSEXIndex();
-    const dsexAudit = DataAuditor.auditDSEXHistory(dsex);
-    if (dsexAudit.passed) {
-      await publishDSEXHistory(dsexAudit.cleaned);
-      console.log(`[PIPELINE] Published ${dsexAudit.cleaned.length} audited DSEX index sessions.`);
-    }
-  } catch (err) {
-    console.error(`[PIPELINE ERROR] Weekend calibration failed: ${err.message}`);
   }
 }, { timezone: DHAKA_TZ });

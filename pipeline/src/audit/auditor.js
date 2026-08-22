@@ -23,11 +23,11 @@ export class DataAuditor {
     }
 
     // Sort chronologically
-    const sorted = [...records].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const sorted = [...records].sort((a, b) => new Date(a.trade_date || a.date) - new Date(b.trade_date || b.date));
 
     for (let i = 0; i < sorted.length; i++) {
       const r = sorted[i];
-      const dStr = String(r.date || r.fetchedAt || '').slice(0, 10);
+      const dStr = String(r.trade_date || r.date || r.fetchedAt || '').slice(0, 10);
       const close = Number(r.close ?? r.ltp ?? 0);
 
       // Check 1: Date format validation
@@ -66,15 +66,21 @@ export class DataAuditor {
         warnings.push(`Unusual P/E on ${dStr}: ${pe}x`);
       }
 
+      // No 0/close fallbacks: this project's whole sourcing policy is that a
+      // genuinely unknown value stays null, never a fabricated "confirmed zero" or
+      // (for ycp) a copy of today's close that would silently zero out change%.
+      const hasYcp = r.ycp !== null && r.ycp !== undefined;
+      const ycpVal = hasYcp ? Number(r.ycp) : null;
       cleanRecords.push({
         symbol: symbol.toUpperCase().trim(),
         date: dStr,
+        trade_date: dStr,
         close,
         ltp: close,
-        ycp: Number(r.ycp ?? close),
-        change: Number(r.change || 0),
-        changePercent: Number(r.changePercent || 0),
-        volume: Number(r.volume || 0),
+        ycp: ycpVal,
+        change: r.change !== null && r.change !== undefined ? Number(r.change) : (hasYcp && ycpVal > 0 ? Number((close - ycpVal).toFixed(2)) : null),
+        changePercent: r.changePercent !== null && r.changePercent !== undefined ? Number(r.changePercent) : (hasYcp && ycpVal > 0 ? Number((((close - ycpVal) / ycpVal) * 100).toFixed(2)) : null),
+        volume: r.volume !== null && r.volume !== undefined ? Number(r.volume) : null,
         pe
       });
     }
@@ -91,7 +97,7 @@ export class DataAuditor {
   }
 
   /**
-   * Audit 20-Year Audited Financial Statements
+   * Audit Annual Financial Statements
    */
   static auditFinancialStatements(symbol, statements = []) {
     const errors = [];
@@ -110,33 +116,36 @@ export class DataAuditor {
     }
 
     for (const stmt of statements) {
-      const yr = Number(stmt.year || stmt.fiscal_year);
-      if (isNaN(yr) || yr < 2000 || yr > 2030) {
-        errors.push(`Invalid fiscal year: ${stmt.year}`);
+      const yr = parseInt(stmt.year || stmt.fiscal_year || 0);
+
+      // Check 1: Valid year
+      if (!yr || yr < 1990 || yr > 2050) {
+        errors.push(`Invalid fiscal year: ${stmt.year || stmt.fiscal_year}`);
         continue;
       }
 
       if (seenYears.has(yr)) {
-        warnings.push(`Duplicate statement for FY${yr} filtered out`);
+        warnings.push(`Duplicate report for FY${yr} filtered out`);
         continue;
       }
       seenYears.add(yr);
 
-      const eps = Number(stmt.eps ?? stmt.eps_basic ?? 0);
-      const navps = Number(stmt.navps ?? stmt.nav_per_share ?? 0);
-      const roe = Number(stmt.roe ?? 0);
+      const eps = stmt.eps !== null && stmt.eps !== undefined ? Number(stmt.eps) : null;
+      const navps = stmt.navps !== null && stmt.navps !== undefined ? Number(stmt.navps) : null;
+      // null, not a fabricated 0 -- P/E, P/B, and paid-up capital of literally 0 are
+      // impossible for a real listed company, and an unstated ROE/dividend/bonus is
+      // "not disclosed", not "confirmed zero". ROE is still derived from real
+      // eps/navps when both are present -- that's exact arithmetic, not a guess.
+      const roe = stmt.roe !== null && stmt.roe !== undefined
+        ? Number(stmt.roe)
+        : (eps !== null && navps !== null && navps > 0 ? Number(((eps / navps) * 100).toFixed(2)) : null);
 
-      // Check NAVPS positivity
-      if (navps <= 0) {
-        warnings.push(`FY${yr} NAVPS is negative or zero (৳${navps})`);
+      if (eps !== null && (eps < -200 || eps > 1000)) {
+        warnings.push(`Outlier EPS in FY${yr}: ৳${eps}`);
       }
 
-      // Check ROE vs EPS / NAVPS reasonableness
-      if (navps > 0) {
-        const impliedRoe = (eps / navps) * 100;
-        if (Math.abs(impliedRoe - roe) > 15) {
-          warnings.push(`FY${yr} ROE discrepancy: stated ${roe}%, implied ${impliedRoe.toFixed(1)}%`);
-        }
+      if (navps !== null && navps <= 0) {
+        warnings.push(`FY${yr} NAVPS is negative or zero (৳${navps})`);
       }
 
       cleanStatements.push({
@@ -145,20 +154,15 @@ export class DataAuditor {
         fiscal_year: yr,
         period: stmt.period || 'Annual',
         eps,
-        eps_basic: eps,
         navps,
-        nav_per_share: navps,
-        roe: Number(roe.toFixed(2)),
-        dividendYield: Number(stmt.dividendYield ?? stmt.dividend_yield ?? 0),
-        dividend_yield: Number(stmt.dividendYield ?? stmt.dividend_yield ?? 0),
-        pe: Number(stmt.pe ?? stmt.pe_ratio ?? 12),
-        pe_ratio: Number(stmt.pe ?? stmt.pe_ratio ?? 12),
-        debtToEquity: Number(stmt.debtToEquity ?? stmt.debt_to_equity ?? 0.4),
-        currentRatio: Number(stmt.currentRatio ?? stmt.current_ratio ?? 1.8),
-        paidUpCapital: Number(stmt.paidUpCapital ?? stmt.paid_up_capital_mn ?? 500),
-        paid_up_capital_mn: Number(stmt.paidUpCapital ?? stmt.paid_up_capital_mn ?? 500),
-        auditStatus: stmt.auditStatus || stmt.audit_status || 'Audited',
-        audit_status: stmt.auditStatus || stmt.audit_status || 'Audited'
+        dps: stmt.dps !== null && stmt.dps !== undefined ? Number(stmt.dps) : null,
+        bonus_pct: stmt.bonus_pct !== null && stmt.bonus_pct !== undefined ? Number(stmt.bonus_pct) : null,
+        roe: roe !== null ? Number(roe.toFixed(2)) : null,
+        pe_ratio: stmt.pe_ratio !== null && stmt.pe_ratio !== undefined ? Number(stmt.pe_ratio) : null,
+        pb_ratio: stmt.pb_ratio !== null && stmt.pb_ratio !== undefined ? Number(stmt.pb_ratio) : null,
+        dividend_yield: stmt.dividend_yield !== null && stmt.dividend_yield !== undefined ? Number(stmt.dividend_yield) : null,
+        paid_up_capital_mn: stmt.paid_up_capital_mn !== null && stmt.paid_up_capital_mn !== undefined ? Number(stmt.paid_up_capital_mn) : null,
+        source: stmt.source || 'DSE_OFFICIAL'
       });
     }
 
@@ -184,27 +188,34 @@ export class DataAuditor {
     const seenDates = new Set();
 
     for (const r of records) {
-      const dStr = String(r.date || '').slice(0, 10);
-      const dsex = Number(r.dsexIndex ?? r.dsex_index ?? 0);
+      const dStr = String(r.trade_date || r.date || '').slice(0, 10);
+      const rawDsex = r.index_value ?? r.dsexIndex ?? r.dsex_index;
 
       if (!dStr || seenDates.has(dStr)) continue;
       seenDates.add(dStr);
 
-      if (dsex < 500 || dsex > 20000) {
+      if (rawDsex == null) {
+        warnings.push(`No DSEX value present for ${dStr} -- record skipped, not audited as an error`);
+        continue;
+      }
+      const dsex = Number(rawDsex);
+
+      if (isNaN(dsex) || dsex < 500 || dsex > 20000) {
         errors.push(`DSEX benchmark out of realistic range on ${dStr}: ${dsex}`);
         continue;
       }
 
+      // An index value of 0 is as impossible as a stock price of 0 -- null means
+      // this session's open/high/low genuinely wasn't disclosed by the source.
       cleanRecords.push({
+        trade_date: dStr,
         date: dStr,
+        index_value: dsex,
         dsexIndex: dsex,
-        dsex_index: dsex,
-        turnoverMn: Number(r.turnoverMn ?? r.total_value_mn ?? 0),
-        total_value_mn: Number(r.turnoverMn ?? r.total_value_mn ?? 0),
-        volume: Number(r.volume ?? r.total_volume ?? 0),
-        advancing: Number(r.advancing || 0),
-        declining: Number(r.declining || 0),
-        unchanged: Number(r.unchanged || 0)
+        index_open: r.index_open !== null && r.index_open !== undefined ? Number(r.index_open) : null,
+        index_high: r.index_high !== null && r.index_high !== undefined ? Number(r.index_high) : null,
+        index_low: r.index_low !== null && r.index_low !== undefined ? Number(r.index_low) : null,
+        source: r.source || 'DSEX'
       });
     }
 
@@ -213,7 +224,7 @@ export class DataAuditor {
       totalPoints: cleanRecords.length,
       errors,
       warnings,
-      cleaned: cleanRecords.sort((a, b) => new Date(a.date) - new Date(b.date))
+      cleaned: cleanRecords.sort((a, b) => new Date(a.trade_date || a.date) - new Date(b.trade_date || b.date))
     };
   }
 }

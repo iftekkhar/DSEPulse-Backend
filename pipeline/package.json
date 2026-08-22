@@ -5,17 +5,32 @@
   "type": "module",
   "main": "src/scheduler.js",
   "scripts": {
-    "start": "node src/cli.js --help",
-    "cli": "node src/cli.js",
-    "db:init": "node src/cli.js --init-db",
-    "build:history": "node src/cli.js --build-history",
-    "build:dsex": "node src/cli.js --build-dsex",
-    "build:fundamentals": "node src/cli.js --build-fundamentals",
-    "scrape:audited": "node src/cli.js --scrape-audited",
-    "audit": "node src/cli.js --audit",
-    "test": "node src/audit/test_suite.js",
-    "report": "node src/cli.js --report",
-    "promote:main": "node src/cli.js --promote-main"
+    "start":               "node src/cli.js --help",
+    "cli":                 "node src/cli.js",
+
+    "db:init":             "node src/cli.js --init-db",
+
+    "fetch:companies":     "node src/cli.js --fetch-company-list",
+    "fetch:companies:full":"node src/cli.js --fetch-company-list --details",
+
+    "import:prices":       "node src/cli.js --import-prices",
+    "import:index":        "node src/cli.js --import-index",
+
+    "scrape:gap":          "node src/cli.js --scrape-gap",
+    "scrape:fundamentals": "node src/cli.js --scrape-fundamentals",
+
+    "compute:all":         "node src/cli.js --compute-all",
+    "compute:technical":   "node src/cli.js --compute-technical",
+    "compute:performance": "node src/cli.js --compute-performance",
+    "compute:fundamentals":"node src/cli.js --compute-fundamentals",
+
+    "build:full":          "node src/cli.js --build-full",
+    "resume":              "node src/cli.js --resume",
+
+    "audit":               "node src/cli.js --audit",
+    "test":                "node src/audit/test_suite.js",
+    "report":              "node src/cli.js --report",
+    "promote:main":        "node src/cli.js --promote-main"
   },
   "keywords": [
     "dse",

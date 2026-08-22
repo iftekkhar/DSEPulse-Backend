@@ -90,7 +90,7 @@ export async function scrapeLiveMarketSnapshot() {
 
     const marketBreadth = {
       date: dateStr,
-      dsexIndex: dsexIndex || 5450.25,
+      dsexIndex, // null if the live homepage scrape failed -- never a guessed fallback value
       advancing,
       declining,
       unchanged,

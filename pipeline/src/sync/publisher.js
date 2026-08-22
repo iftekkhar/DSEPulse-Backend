@@ -1,4 +1,5 @@
 import axios from 'axios';
+import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -10,9 +11,20 @@ dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
 const API_BASE = process.env.BACKEND_API_URL || 'http://localhost:5001';
 const INGEST_KEY = process.env.INGEST_API_KEY || 'dse-pulse-internal-key-2026';
 
+// keepAlive: false -- manual_promoter.js loads and groups the ENTIRE staging
+// price-history table (900K+ rows across 395 symbols) into memory between the
+// DSEX publish call and the first per-symbol publish call, a multi-second gap.
+// With Node's default keep-alive agent, that gap is long enough for the server
+// (or an OS-level idle-connection timeout) to close the pooled socket -- the
+// client then reuses the now-dead socket for the next request and gets
+// ECONNRESET. Confirmed via direct reproduction: identical calls succeed every
+// time back-to-back, but fail after that data-loading gap. Disabling keep-alive
+// forces a fresh connection per request, which costs a bit of setup latency but
+// eliminates the stale-socket race outright.
 const client = axios.create({
   baseURL: API_BASE,
   timeout: 30000,
+  httpAgent: new http.Agent({ keepAlive: false }),
   headers: {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${INGEST_KEY}`

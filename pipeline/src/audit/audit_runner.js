@@ -18,18 +18,17 @@ export async function runFullStagingAudit() {
   let totalAuditedRecords = 0;
 
   // 1. Audit Price History in Staging DB
-  console.log('1. Auditing `stg_price_history`...');
-  const priceRows = await dbAll('SELECT * FROM stg_price_history ORDER BY symbol, date ASC');
-  totalAuditedRecords += priceRows.length;
-
-  const symbolsMap = new Map();
-  for (const r of priceRows) {
-    if (!symbolsMap.has(r.symbol)) symbolsMap.set(r.symbol, []);
-    symbolsMap.get(r.symbol).push(r);
-  }
-
+  console.log('1. Auditing `stg_price_history` (streaming symbol-by-symbol)...');
+  const priceSymbols = await dbAll('SELECT DISTINCT symbol FROM stg_price_history ORDER BY symbol ASC');
   let priceAuditPassed = true;
-  for (const [sym, records] of symbolsMap.entries()) {
+  let totalPriceRecords = 0;
+
+  for (let i = 0; i < priceSymbols.length; i++) {
+    const sym = priceSymbols[i].symbol;
+    const records = await dbAll('SELECT * FROM stg_price_history WHERE symbol = ? ORDER BY trade_date ASC', [sym]);
+    totalPriceRecords += records.length;
+    totalAuditedRecords += records.length;
+
     const auditRes = DataAuditor.auditPriceHistory(sym, records);
     if (!auditRes.passed) {
       priceAuditPassed = false;
@@ -38,13 +37,14 @@ export async function runFullStagingAudit() {
     }
     totalWarnings += auditRes.warnings.length;
   }
+
   if (priceAuditPassed) {
-    console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${priceRows.length} price records across ${symbolsMap.size} symbols. 0 blocking errors.`);
+    console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${totalPriceRecords.toLocaleString()} price records across ${priceSymbols.length} symbols. 0 blocking errors.`);
   }
 
-  // 2. Audit 20-Year Financial Statements in Staging DB
-  console.log('\n2. Auditing `stg_fundamentals_history`...');
-  const fundRows = await dbAll('SELECT * FROM stg_fundamentals_history ORDER BY symbol, fiscal_year DESC');
+  // 2. Audit Annual Financial Statements in Staging DB
+  console.log('\n2. Auditing `stg_annual_fundamentals`...');
+  const fundRows = await dbAll('SELECT * FROM stg_annual_fundamentals ORDER BY symbol, fiscal_year DESC');
   totalAuditedRecords += fundRows.length;
 
   const fundSymbolsMap = new Map();
@@ -67,9 +67,9 @@ export async function runFullStagingAudit() {
     console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${fundRows.length} annual disclosures across ${fundSymbolsMap.size} companies. 0 blocking errors.`);
   }
 
-  // 3. Audit DSEX Macro Benchmark in Staging DB
-  console.log('\n3. Auditing `stg_dsex_market_history`...');
-  const dsexRows = await dbAll('SELECT * FROM stg_dsex_market_history ORDER BY date ASC');
+  // 3. Audit Index History Benchmark in Staging DB
+  console.log('\n3. Auditing `stg_index_history`...');
+  const dsexRows = await dbAll('SELECT * FROM stg_index_history ORDER BY trade_date ASC');
   totalAuditedRecords += dsexRows.length;
 
   let dsexAuditPassed = true;
@@ -82,10 +82,10 @@ export async function runFullStagingAudit() {
     }
     totalWarnings += dsexAudit.warnings.length;
     if (dsexAuditPassed) {
-      console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${dsexRows.length} DSEX historical sessions. 0 blocking errors.`);
+      console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${dsexRows.length.toLocaleString()} DSEX historical sessions. 0 blocking errors.`);
     }
   } else {
-    console.log('  \x1b[33m⚠ NOTICE\x1b[0m No DSEX records currently in staging DB (run `npm run build:dsex` to stage).');
+    console.log('  \x1b[33m⚠ NOTICE\x1b[0m No DSEX records currently in staging DB.');
   }
 
   const overallPassed = priceAuditPassed && fundAuditPassed && dsexAuditPassed && totalErrors === 0;

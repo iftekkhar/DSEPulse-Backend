@@ -7,9 +7,12 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "node server/index.js",
-    "scrape:audited": "node server/scrapers/audited_eps_scraper.js",
-    "backfill:fundamentals": "node scripts/backfill_fundamentals_20y.js",
-    "backfill:dsex": "node scripts/backfill_dsex_history_20y.js"
+    "resume": "npm --prefix pipeline run resume",
+    "build:full": "npm --prefix pipeline run build:full",
+    "pipeline": "npm --prefix pipeline start",
+    "pipeline:audit": "npm --prefix pipeline run audit",
+    "pipeline:report": "npm --prefix pipeline run report",
+    "scrape:audited": "node server/scrapers/audited_eps_scraper.js"
   },
   "engines": {
     "node": ">=20.0.0"

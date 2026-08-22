@@ -16,14 +16,23 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# SQLite Database & Cache files
+# SQLite Database & Cache files (including timestamped safety backups, e.g. dse.db.bak-20260822-103449)
 *.db
 *.db-shm
 *.db-wal
+*.db.bak-*
+*.db.bak-*-shm
+*.db.bak-*-wal
 *.sqlite
 *.sqlite3
 
 # Temporary Excel/Data dumps
 *.xlsx
 *.csv
+
+# Raw source dataset dumps (Kaggle/Mendeley/etc.) and local staging working data
+pipeline/data/
+
+# Claude Code local tool state
+.claude/
 

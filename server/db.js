@@ -237,13 +237,82 @@ export async function saveDailyClosingToDB(records, dateStr) {
       const close = Number(r.ltp ?? r.close ?? r.closePrice ?? 0);
       if (!symbol || close <= 0) continue;
 
-      const ycp = Number(r.ycp ?? 0);
-      const change = Number(r.change ?? (ycp > 0 ? close - ycp : 0));
-      const change_percent = Number(r.changePercent ?? (ycp > 0 ? ((close - ycp) / ycp) * 100 : 0));
-      const volume = Number(r.volume ?? 0);
+      // None of these are NOT NULL in the schema -- preserve null for anything
+      // genuinely missing rather than writing a fabricated 0 (a real stock's ycp,
+      // change, or volume is never actually 0 in the "we don't know" sense).
+      const ycp = r.ycp !== null && r.ycp !== undefined ? Number(r.ycp) : null;
+      const change = r.change !== null && r.change !== undefined
+        ? Number(r.change)
+        : (ycp !== null && ycp > 0 ? Number((close - ycp).toFixed(2)) : null);
+      const change_percent = r.changePercent !== null && r.changePercent !== undefined
+        ? Number(r.changePercent)
+        : (ycp !== null && ycp > 0 ? Number((((close - ycp) / ycp) * 100).toFixed(2)) : null);
+      const volume = r.volume !== null && r.volume !== undefined ? Number(r.volume) : null;
       const pe = r.pe !== null && r.pe !== undefined ? Number(r.pe) : null;
 
       stmt.run([symbol, targetDate, close, ycp, change, change_percent, volume, pe]);
+      count++;
+    }
+
+    await new Promise((res, rej) => stmt.finalize(err => err ? rej(err) : res()));
+    await dbRun('COMMIT');
+  } catch (err) {
+    await dbRun('ROLLBACK');
+    throw err;
+  }
+  return count;
+}
+
+// 1b. Bulk-write one symbol's full multi-date history in a SINGLE transaction.
+// saveDailyClosingToDB above is shaped for "many symbols, one shared date" (Job 1's
+// use case) and does its own BEGIN/COMMIT per call -- fine for that, but calling it
+// once per row to ingest one symbol's multi-year history (as /api/ingest/history
+// used to) means one transaction (fsync) per row: thousands of commits for a single
+// symbol, slow enough to time out the caller. This does the same upsert, but for
+// many (date, record) pairs against one symbol in one transaction.
+export async function saveSymbolHistoryBulk(symbol, records) {
+  if (!records || !Array.isArray(records) || records.length === 0) return 0;
+  if (!isSqliteAvailable || !db) return 0;
+  const cleanSym = (symbol || '').toUpperCase().trim();
+  if (!cleanSym) return 0;
+
+  let count = 0;
+  await dbRun('BEGIN TRANSACTION');
+  try {
+    const stmt = dbPrepare(`
+      INSERT INTO price_history (symbol, date, close, ycp, change, change_percent, volume, pe)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(symbol, date) DO UPDATE SET
+        close = excluded.close,
+        ycp = excluded.ycp,
+        change = excluded.change,
+        change_percent = excluded.change_percent,
+        volume = excluded.volume,
+        pe = excluded.pe
+    `);
+
+    for (const r of records) {
+      const date = r.date;
+      const close = Number(r.close ?? r.ltp ?? 0);
+      if (!date || close <= 0) continue;
+
+      // Defaulting ycp to `close` when missing silently forces change/changePercent
+      // to compute as exactly 0 (close - close) -- fabricating "no price movement"
+      // for a day whose real prior close simply wasn't provided. Preserve null
+      // throughout instead: these mean different things, and collapsing "unknown"
+      // into "known zero" is exactly the kind of silent fabrication this project's
+      // sourcing policy exists to prevent.
+      const ycp = r.ycp !== null && r.ycp !== undefined ? Number(r.ycp) : null;
+      const change = r.change !== null && r.change !== undefined
+        ? Number(r.change)
+        : (ycp !== null && ycp > 0 ? Number((close - ycp).toFixed(2)) : null);
+      const change_percent = r.changePercent !== null && r.changePercent !== undefined
+        ? Number(r.changePercent)
+        : (ycp !== null && ycp > 0 ? Number((((close - ycp) / ycp) * 100).toFixed(2)) : null);
+      const volume = r.volume !== null && r.volume !== undefined ? Number(r.volume) : null;
+      const pe = r.pe !== null && r.pe !== undefined ? Number(r.pe) : null;
+
+      stmt.run([cleanSym, date, close, ycp, change, change_percent, volume, pe]);
       count++;
     }
 
@@ -270,21 +339,8 @@ export async function getHistoricalTimeline(symbol, limit = 7500) {
     ) ORDER BY fetchedAt ASC
   `, [cleanSym, limit]);
 
-  if (!rows || rows.length < 5) {
-    const fund = await dbGet('SELECT * FROM company_fundamentals WHERE symbol = ?', [cleanSym]);
-    await seedStockHistoryOnDemand(cleanSym, fund);
-    rows = await dbAll(`
-      SELECT * FROM (
-        SELECT SUBSTR(date, 1, 10) as fetchedAt, close as ltp, ycp, change, change_percent as changePercent, volume, pe
-        FROM price_history
-        WHERE symbol = ?
-        GROUP BY SUBSTR(date, 1, 10)
-        ORDER BY date DESC
-        LIMIT ?
-      ) ORDER BY fetchedAt ASC
-    `, [cleanSym, limit]);
-  }
-
+  // A symbol with few/no rows here genuinely has little or no history yet -- return
+  // that honestly rather than fabricating a synthetic trajectory to fill the gap.
   return rows || [];
 }
 
@@ -301,6 +357,32 @@ export async function getLatestRecordedClosing(symbol) {
 }
 
 // 4. Save Single Company Fundamentals to SQLite
+// Fields that describe one specific audited fiscal period as a coherent set (EPS,
+// NAVPS, P/E, dividend yield, debt/equity, current ratio). Previously each column was
+// upserted independently via COALESCE(new, existing) -- so a write carrying a fresh
+// EPS for a new fiscal year but no NAVPS (because that particular scrape/endpoint
+// didn't have it) would silently leave the OLD period's NAVPS in place, blending two
+// different years into one "current" row (e.g. FY2025 EPS paired with FY2020 NAVPS --
+// produced ROE readings above 10,000%). Now: when the incoming record's audited_period
+// genuinely differs from what's stored, these fields are replaced atomically as a set
+// (including going to NULL for one the new disclosure doesn't report), instead of
+// preserving stale values from a different period. `IS NOT` is used for the period
+// comparison because it's null-safe in SQLite (unlike `!=`), so a first-ever period
+// value is also treated as "different" and triggers the atomic replace.
+const PERIOD_COUPLED_SET_CLAUSE = `
+      eps_basic = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.eps_basic ELSE COALESCE(excluded.eps_basic, company_fundamentals.eps_basic) END,
+      eps_diluted = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.eps_diluted ELSE COALESCE(excluded.eps_diluted, company_fundamentals.eps_diluted) END,
+      eps_quarterly = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.eps_quarterly ELSE COALESCE(excluded.eps_quarterly, company_fundamentals.eps_quarterly) END,
+      nav_per_share = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.nav_per_share ELSE COALESCE(excluded.nav_per_share, company_fundamentals.nav_per_share) END,
+      pe_basic = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.pe_basic ELSE COALESCE(excluded.pe_basic, company_fundamentals.pe_basic) END,
+      pe_diluted = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.pe_diluted ELSE COALESCE(excluded.pe_diluted, company_fundamentals.pe_diluted) END,
+      pe_trailing = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.pe_trailing ELSE COALESCE(excluded.pe_trailing, company_fundamentals.pe_trailing) END,
+      dividend_yield = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.dividend_yield ELSE COALESCE(excluded.dividend_yield, company_fundamentals.dividend_yield) END,
+      debt_to_equity = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.debt_to_equity ELSE COALESCE(excluded.debt_to_equity, company_fundamentals.debt_to_equity) END,
+      current_ratio = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.current_ratio ELSE COALESCE(excluded.current_ratio, company_fundamentals.current_ratio) END,
+      quarterly_disclosure = CASE WHEN excluded.audited_period IS NOT NULL AND excluded.audited_period IS NOT company_fundamentals.audited_period THEN excluded.quarterly_disclosure ELSE COALESCE(excluded.quarterly_disclosure, company_fundamentals.quarterly_disclosure) END,
+      audited_period = COALESCE(excluded.audited_period, company_fundamentals.audited_period)`;
+
 export async function saveFundamentals(data) {
   if (!data || !data.symbol) return;
   const symbol = data.symbol.toUpperCase().trim();
@@ -316,20 +398,9 @@ export async function saveFundamentals(data) {
       name = COALESCE(excluded.name, company_fundamentals.name),
       sector = COALESCE(excluded.sector, company_fundamentals.sector),
       category = COALESCE(excluded.category, company_fundamentals.category),
-      eps_basic = COALESCE(excluded.eps_basic, company_fundamentals.eps_basic),
-      eps_diluted = COALESCE(excluded.eps_diluted, company_fundamentals.eps_diluted),
-      eps_quarterly = COALESCE(excluded.eps_quarterly, company_fundamentals.eps_quarterly),
-      nav_per_share = COALESCE(excluded.nav_per_share, company_fundamentals.nav_per_share),
       paid_up_capital_mn = COALESCE(excluded.paid_up_capital_mn, company_fundamentals.paid_up_capital_mn),
       authorized_capital_mn = COALESCE(excluded.authorized_capital_mn, company_fundamentals.authorized_capital_mn),
-      pe_basic = COALESCE(excluded.pe_basic, company_fundamentals.pe_basic),
-      pe_diluted = COALESCE(excluded.pe_diluted, company_fundamentals.pe_diluted),
-      pe_trailing = COALESCE(excluded.pe_trailing, company_fundamentals.pe_trailing),
-      dividend_yield = COALESCE(excluded.dividend_yield, company_fundamentals.dividend_yield),
-      debt_to_equity = COALESCE(excluded.debt_to_equity, company_fundamentals.debt_to_equity),
-      current_ratio = COALESCE(excluded.current_ratio, company_fundamentals.current_ratio),
-      audited_period = COALESCE(excluded.audited_period, company_fundamentals.audited_period),
-      quarterly_disclosure = COALESCE(excluded.quarterly_disclosure, company_fundamentals.quarterly_disclosure),
+      ${PERIOD_COUPLED_SET_CLAUSE},
       updated_at = datetime('now')
   `, [
     symbol,
@@ -428,20 +499,9 @@ export async function saveFundamentalsBulkDelta(records) {
         name = COALESCE(excluded.name, company_fundamentals.name),
         sector = COALESCE(excluded.sector, company_fundamentals.sector),
         category = COALESCE(excluded.category, company_fundamentals.category),
-        eps_basic = COALESCE(excluded.eps_basic, company_fundamentals.eps_basic),
-        eps_diluted = COALESCE(excluded.eps_diluted, company_fundamentals.eps_diluted),
-        eps_quarterly = COALESCE(excluded.eps_quarterly, company_fundamentals.eps_quarterly),
-        nav_per_share = COALESCE(excluded.nav_per_share, company_fundamentals.nav_per_share),
         paid_up_capital_mn = COALESCE(excluded.paid_up_capital_mn, company_fundamentals.paid_up_capital_mn),
         authorized_capital_mn = COALESCE(excluded.authorized_capital_mn, company_fundamentals.authorized_capital_mn),
-        pe_basic = COALESCE(excluded.pe_basic, company_fundamentals.pe_basic),
-        pe_diluted = COALESCE(excluded.pe_diluted, company_fundamentals.pe_diluted),
-        pe_trailing = COALESCE(excluded.pe_trailing, company_fundamentals.pe_trailing),
-        dividend_yield = COALESCE(excluded.dividend_yield, company_fundamentals.dividend_yield),
-        debt_to_equity = COALESCE(excluded.debt_to_equity, company_fundamentals.debt_to_equity),
-        current_ratio = COALESCE(excluded.current_ratio, company_fundamentals.current_ratio),
-        audited_period = COALESCE(excluded.audited_period, company_fundamentals.audited_period),
-        quarterly_disclosure = COALESCE(excluded.quarterly_disclosure, company_fundamentals.quarterly_disclosure),
+        ${PERIOD_COUPLED_SET_CLAUSE},
         updated_at = datetime('now')
     `);
 
@@ -530,13 +590,15 @@ export async function saveIntradayBreadthSnapshot(data) {
     ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   `, [
     nowDhaka,
-    data.advancing || 0,
-    data.declining || 0,
-    data.unchanged || 0,
-    data.totalTrades || 0,
-    data.totalVolume || 0,
-    data.totalValueMn || 0,
-    data.dsexIndex || 0
+    // null (not 0) when the scrape didn't return a field -- 0 would assert
+    // "confirmed zero" for something that's actually just unknown.
+    data.advancing ?? null,
+    data.declining ?? null,
+    data.unchanged ?? null,
+    data.totalTrades ?? null,
+    data.totalVolume ?? null,
+    data.totalValueMn ?? null,
+    data.dsexIndex ?? null
   ]);
 }
 
@@ -549,6 +611,20 @@ export async function getIntradayBreadthSnapshot() {
 export async function saveDSEXDailyClosing(data, dateStr) {
   if (!data) return;
   const targetDate = dateStr || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Dhaka' }).format(new Date());
+
+  // dsex_index is NOT NULL in the schema (it's the permanent historical record),
+  // so there's no honest way to persist "unknown" for it the way the other fields
+  // use null. The old `|| 0` fallback meant a failed scrape would silently write a
+  // literal DSEX=0 into 20-year history -- the previous close being a few thousand
+  // points, that's about as clearly wrong as a value can be. Skip the write
+  // entirely instead: no row today is correct; a fabricated 0 is not.
+  const dsexIndex = data.dsexIndex !== null && data.dsexIndex !== undefined && Number(data.dsexIndex) > 0
+    ? Number(data.dsexIndex)
+    : null;
+  if (dsexIndex === null) {
+    console.warn(`[SQLITE] saveDSEXDailyClosing: no real DSEX value for ${targetDate}, skipping write (not fabricating).`);
+    return;
+  }
 
   await dbRun(`
     INSERT INTO dsex_market_history (
@@ -564,34 +640,26 @@ export async function saveDSEXDailyClosing(data, dateStr) {
       total_value_mn = excluded.total_value_mn
   `, [
     targetDate,
-    data.dsexIndex || 0,
-    data.advancing || 0,
-    data.declining || 0,
-    data.unchanged || 0,
-    data.totalTrades || 0,
-    data.totalVolume || 0,
-    data.totalValueMn || 0
+    dsexIndex,
+    data.advancing ?? null,
+    data.declining ?? null,
+    data.unchanged ?? null,
+    data.totalTrades ?? null,
+    data.totalVolume ?? null,
+    data.totalValueMn ?? null
   ]);
 }
 
 // 5d. Get 20-Year DSEX Historical Timeline
 export async function getDSEXHistoricalTimeline(limit = 7500) {
+  // No auto-seed fallback here: if there's real data, return it; if there's not
+  // (or not much), that's the honest answer -- never top it up with fabricated rows.
   let rows = await dbAll(`
     SELECT date, dsex_index as dsexIndex, advancing, declining, unchanged, total_value_mn as turnoverMn, total_volume as volume
     FROM dsex_market_history
     ORDER BY date ASC
     LIMIT ?
   `, [limit]);
-
-  if (!rows || rows.length < 50) {
-    await autoSeed20YearHistory();
-    rows = await dbAll(`
-      SELECT date, dsex_index as dsexIndex, advancing, declining, unchanged, total_value_mn as turnoverMn, total_volume as volume
-      FROM dsex_market_history
-      ORDER BY date ASC
-      LIMIT ?
-    `, [limit]);
-  }
 
   return rows || [];
 }
@@ -700,8 +768,7 @@ export async function getAllStocksFromDB() {
         roe,
         marketCap,
         closeDate: r.closeDate || null,
-        auditedPeriod,
-        auditedYear: auditedPeriod ? (auditedPeriod.includes('2026') ? 'FY26 Audited' : (auditedPeriod.includes('2024') ? 'FY24 Audited' : 'FY25 Audited')) : null
+        auditedPeriod
       };
     });
   }
@@ -767,413 +834,6 @@ export async function exportToExcel(symbolFilter = null) {
   return await workbook.xlsx.writeBuffer();
 }
 
-// 7. Auto-seed SQLite Database from Master Dataset on startup (Standalone SQLite SSOT)
-export async function seed20YearFromMasterExcel() {
-  if (!isSqliteAvailable || !db) {
-    return;
-  }
-
-  try {
-    const row = await dbGet('SELECT COUNT(*) as total FROM price_history');
-    if (row && row.total > 50000) {
-      console.log(`[SQLITE] Master SQLite Database ready with ${row.total} daily closing records.`);
-      return;
-    }
-
-    const EXCEL_PATH = path.join(DATA_DIR, 'DSE_20_Year_Master_Dataset_2005_2026.xlsx');
-    if (!fs.existsSync(EXCEL_PATH)) {
-      return;
-    }
-
-    console.log('[SQLITE] Streaming Master Excel dataset into SQLite database (2005–2026)...');
-    await applyPragmas();
-
-    const options = { entries: 'emit', sharedStrings: 'cache', worksheets: 'emit' };
-    const workbookReader = new ExcelJS.stream.xlsx.WorkbookReader(EXCEL_PATH, options);
-
-    let priceCount = 0;
-    let dirCount = 0;
-    let kpiCount = 0;
-
-    for await (const worksheetReader of workbookReader) {
-      const sheetName = worksheetReader.name;
-
-      if (sheetName === 'Company_Directory') {
-        await dbRun('BEGIN TRANSACTION');
-        const stmtDir = dbPrepare(`
-          INSERT INTO company_fundamentals (symbol, name, sector, category, paid_up_capital_mn, authorized_capital_mn, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-          ON CONFLICT(symbol) DO UPDATE SET
-            name = excluded.name,
-            sector = excluded.sector,
-            category = excluded.category,
-            paid_up_capital_mn = excluded.paid_up_capital_mn,
-            authorized_capital_mn = excluded.authorized_capital_mn,
-            updated_at = datetime('now')
-        `);
-
-        for await (const row of worksheetReader) {
-          if (row.number === 1) continue;
-          const symbol = String(row.values[1] || '').toUpperCase().trim();
-          const name = String(row.values[2] || '');
-          const sector = String(row.values[3] || '');
-          const category = String(row.values[4] || 'A');
-          const paidUp = Number(row.values[7] || 0);
-          const authCap = Number(row.values[8] || 0);
-
-          if (symbol) {
-            stmtDir.run([symbol, name, sector, category, paidUp, authCap]);
-            dirCount++;
-          }
-        }
-        await new Promise((res, rej) => stmtDir.finalize(err => err ? rej(err) : res()));
-        await dbRun('COMMIT');
-        console.log(`[SQLITE] Seeded ${dirCount} company directory profiles.`);
-      } else if (sheetName === 'Audited_Quarterly_KPIs') {
-        await dbRun('BEGIN TRANSACTION');
-        const stmtKpi = dbPrepare(`
-          UPDATE company_fundamentals SET
-            eps_basic = ?,
-            eps_diluted = ?,
-            nav_per_share = ?,
-            dividend_yield = ?,
-            audited_period = ?,
-            quarterly_disclosure = ?,
-            updated_at = datetime('now')
-          WHERE symbol = ?
-        `);
-
-        for await (const row of worksheetReader) {
-          if (row.number === 1) continue;
-          const symbol = String(row.values[1] || '').toUpperCase().trim();
-          const epsBasic = Number(row.values[2] || 0);
-          const epsDiluted = Number(row.values[3] || 0);
-          const navps = Number(row.values[4] || 0);
-          const divYield = Number(row.values[7] || 0);
-          const period = String(row.values[8] || '');
-          const quarterly = String(row.values[9] || '');
-
-          if (symbol) {
-            stmtKpi.run([epsBasic, epsDiluted, navps, divYield, period, quarterly, symbol]);
-            kpiCount++;
-          }
-        }
-        await new Promise((res, rej) => stmtKpi.finalize(err => err ? rej(err) : res()));
-        await dbRun('COMMIT');
-        console.log(`[SQLITE] Seeded ${kpiCount} company audited KPIs.`);
-      } else if (sheetName === '20Y_Master_History' || sheetName === 'Sheet1') {
-        console.log('[SQLITE] Bulk inserting 20-Year Master History records...');
-        let batchCount = 0;
-        await dbRun('BEGIN TRANSACTION');
-        let stmtPrice = dbPrepare(`
-          INSERT INTO price_history (symbol, date, close, ycp, change, change_percent, volume, pe)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(symbol, date) DO UPDATE SET
-            close = excluded.close,
-            ycp = excluded.ycp,
-            change = excluded.change,
-            change_percent = excluded.change_percent,
-            volume = excluded.volume,
-            pe = excluded.pe
-        `);
-
-        for await (const row of worksheetReader) {
-          if (row.number === 1) continue;
-          const symbol = String(row.values[1] || '').toUpperCase().trim();
-          let rawDate = row.values[2];
-          let dateStr = '';
-          if (rawDate instanceof Date) {
-            dateStr = rawDate.toISOString().slice(0, 10);
-          } else if (typeof rawDate === 'string') {
-            dateStr = rawDate.trim().slice(0, 10);
-          }
-
-          const close = Number(row.values[3] || 0);
-          const ycp = Number(row.values[4] || 0);
-          const change = Number(row.values[5] || (ycp > 0 ? close - ycp : 0));
-          const changePercent = Number(row.values[6] || (ycp > 0 ? ((close - ycp) / ycp) * 100 : 0));
-          const volume = Number(row.values[7] || 0);
-          const pe = row.values[8] !== null && row.values[8] !== undefined ? Number(row.values[8]) : null;
-
-          if (symbol && dateStr && close > 0 && !dateStr.includes(':')) {
-            stmtPrice.run([symbol, dateStr, close, ycp, change, changePercent, volume, pe]);
-            priceCount++;
-            batchCount++;
-
-            if (batchCount >= 10000) {
-              await new Promise((res, rej) => stmtPrice.finalize(err => err ? rej(err) : res()));
-              await dbRun('COMMIT');
-              await dbRun('BEGIN TRANSACTION');
-              stmtPrice = dbPrepare(`
-                INSERT INTO price_history (symbol, date, close, ycp, change, change_percent, volume, pe)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, date) DO UPDATE SET
-                  close = excluded.close,
-                  ycp = excluded.ycp,
-                  change = excluded.change,
-                  change_percent = excluded.change_percent,
-                  volume = excluded.volume,
-                  pe = excluded.pe
-              `);
-              batchCount = 0;
-            }
-          }
-        }
-        await new Promise((res, rej) => stmtPrice.finalize(err => err ? rej(err) : res()));
-        await dbRun('COMMIT');
-        console.log(`[SQLITE] Successfully imported ${priceCount} price history records.`);
-      }
-    }
-  } catch (err) {
-    console.error('[SQLITE] Master Excel import error:', err.message);
-  }
-}
-
-// 8. Seed latest snapshot fallback if database empty
-export async function seedFromLatestJson() {
-  if (!isSqliteAvailable || !db) return;
-  const JSON_PATH = path.join(DATA_DIR, 'latest.json');
-  if (!fs.existsSync(JSON_PATH)) return;
-
-  try {
-    const row = await dbGet('SELECT COUNT(*) as total FROM company_fundamentals');
-    if (row && row.total >= 400) return;
-
-    const raw = fs.readFileSync(JSON_PATH, 'utf8');
-    const parsed = JSON.parse(raw);
-    const stocks = parsed.stocks || parsed;
-
-    if (Array.isArray(stocks) && stocks.length > 0) {
-      console.log(`[SQLITE] Seeding ${stocks.length} company fundamentals from bundled snapshot...`);
-      await saveFundamentalsBulkDelta(stocks);
-    }
-  } catch (e) {
-    console.warn('[SQLITE] Bundled seed notice:', e.message);
-  }
-}
-
-// Generate DSE trading dates: Weekly / Monthly snapshots across 2005-2023 + Daily for 2024-2026
-export function generateTradingDates(startYear = 2005, _endYear = 2026) {
-  const dates = [];
-  const start = new Date(`${startYear}-01-01`);
-  const end = new Date(); // Today
-  const curr = new Date(start);
-  while (curr <= end) {
-    const day = curr.getDay(); // 0 = Sun, 1 = Mon, 2 = Tue, 3 = Wed, 4 = Thu
-    const year = curr.getFullYear();
-    if (year < 2024) {
-      if (day === 4 || curr.getDate() === 1) {
-        dates.push(curr.toISOString().slice(0, 10));
-      }
-    } else {
-      if (day >= 0 && day <= 4) {
-        dates.push(curr.toISOString().slice(0, 10));
-      }
-    }
-    curr.setDate(curr.getDate() + 1);
-  }
-  return dates;
-}
-
-// Calculate Realistic DSEX index for any date in 2005-2026
-export function calculateHistoricalDSEX(dateStr) {
-  const year = parseInt(dateStr.slice(0, 4), 10);
-  const month = parseInt(dateStr.slice(5, 7), 10);
-  const day = parseInt(dateStr.slice(8, 10), 10);
-  const fracYear = year + (month - 1) / 12 + day / 365;
-
-  let baseDsex = 1500;
-  if (fracYear <= 2007.0) {
-    baseDsex = 1500 + (fracYear - 2005) * 450;
-  } else if (fracYear <= 2009.0) {
-    baseDsex = 2400 + (fracYear - 2007) * 900;
-  } else if (fracYear <= 2010.9) {
-    // 2010 Super Bubble Peak (~8,918 peak in Dec 2010)
-    baseDsex = 4200 + Math.pow((fracYear - 2009) / 1.9, 1.8) * 4700;
-  } else if (fracYear <= 2013.0) {
-    // Post-Bubble 2011-2012 Crash
-    baseDsex = 8900 - Math.pow((fracYear - 2010.9) / 2.1, 0.9) * 5100;
-  } else if (fracYear <= 2017.9) {
-    // Demutualization & Pre-Election Rally
-    baseDsex = 3800 + (fracYear - 2013) * 520;
-  } else if (fracYear <= 2020.25) {
-    // 2018-2020 Pre-COVID Decline
-    baseDsex = 6300 - (fracYear - 2017.9) * 1100;
-  } else if (fracYear <= 2021.8) {
-    // Post-COVID Liquidity Surge (Peak ~7,367 in Oct 2021)
-    baseDsex = 3700 + Math.pow((fracYear - 2020.25) / 1.55, 1.2) * 3650;
-  } else if (fracYear <= 2023.9) {
-    // Floor Price Regime
-    baseDsex = 7350 - (fracYear - 2021.8) * 500;
-  } else {
-    // 2024-2026 Structural Re-accumulation
-    baseDsex = 6250 - (fracYear - 2023.9) * 350;
-  }
-
-  const noise = (Math.sin(fracYear * 25) * 45) + (Math.cos(fracYear * 50) * 25);
-  return Number(Math.max(1200, baseDsex + noise).toFixed(2));
-}
-
-// On-demand stock trajectory generator for any queried symbol
-export async function seedStockHistoryOnDemand(cleanSym, fund = null) {
-  if (!isSqliteAvailable || !db || !cleanSym) return;
-  const allDates = generateTradingDates(2005, 2026);
-  if (allDates.length === 0) return;
-
-  const currentPrice = Number(fund?.ltp || fund?.close || 20 + (cleanSym.charCodeAt(0) % 100));
-  const eps = Number(fund?.eps_basic || 3.0);
-  const pe = Number(fund?.pe_basic || 12.0);
-  const ipoYear = 2005 + (cleanSym.charCodeAt(0) % 15);
-  const startPrice = Math.max(5.0, Number((currentPrice * (0.15 + ((cleanSym.charCodeAt(cleanSym.length - 1) % 40) / 100))).toFixed(2)));
-
-  const eligibleDates = allDates.filter(d => parseInt(d.slice(0, 4), 10) >= ipoYear);
-  if (eligibleDates.length === 0) return;
-
-  try {
-    await dbRun('BEGIN TRANSACTION');
-    const stmt = dbPrepare(`
-      INSERT INTO price_history (symbol, date, close, ycp, change, change_percent, volume, pe)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(symbol, date) DO UPDATE SET
-        close = excluded.close,
-        ycp = excluded.ycp,
-        change = excluded.change,
-        change_percent = excluded.change_percent,
-        volume = excluded.volume,
-        pe = excluded.pe
-    `);
-
-    let currentP = startPrice;
-    const priceStep = (currentPrice - startPrice) / eligibleDates.length;
-
-    for (let i = 0; i < eligibleDates.length; i++) {
-      const date = eligibleDates[i];
-      const noise = (Math.sin(i * 0.1) * 0.03) + ((Math.random() - 0.48) * 0.02);
-      currentP = Math.max(1.0, currentP + priceStep + (currentP * noise));
-      if (i === eligibleDates.length - 1) currentP = currentPrice;
-
-      const close = Number(currentP.toFixed(2));
-      const ycp = Number((close / (1 + (noise || 0.01))).toFixed(2));
-      const change = Number((close - ycp).toFixed(2));
-      const change_percent = Number((ycp > 0 ? ((change / ycp) * 100) : 0).toFixed(2));
-      const volume = Math.floor(15000 + Math.random() * 350000);
-      const stockPe = Number((pe * (0.85 + (Math.sin(i * 0.05) * 0.25))).toFixed(2));
-
-      stmt.run([cleanSym, date, close, ycp, change, change_percent, volume, stockPe]);
-    }
-
-    await new Promise((res, rej) => stmt.finalize(err => err ? rej(err) : res()));
-    await dbRun('COMMIT');
-  } catch (e) {
-    try { await dbRun('ROLLBACK'); } catch {}
-  }
-}
-
-// 9. Master 20-Year Auto-Seeder: Runs on Boot if Database Empty
-export async function autoSeed20YearHistory() {
-  if (!isSqliteAvailable || !db) return;
-
-  try {
-    const row = await dbGet('SELECT COUNT(*) as total FROM price_history');
-    if (row && row.total >= 5000) {
-      console.log(`[SQLITE] 20-Year Historical DB verified with ${row.total} daily records.`);
-      return;
-    }
-
-    console.log('[SQLITE] Auto-seeding 20-Year master history for all DSE listed companies...');
-    const allDates = generateTradingDates(2005, 2026);
-
-    // 1. Seed DSEX Macro Market History
-    const dsexCount = await dbGet('SELECT COUNT(*) as total FROM dsex_market_history');
-    if (!dsexCount || dsexCount.total < 100) {
-      await dbRun('BEGIN TRANSACTION');
-      const stmtDsex = dbPrepare(`
-        INSERT INTO dsex_market_history (date, dsex_index, advancing, declining, unchanged, total_trades, total_volume, total_value_mn)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(date) DO UPDATE SET dsex_index = excluded.dsex_index
-      `);
-      for (const d of allDates) {
-        const dsexIdx = calculateHistoricalDSEX(d);
-        stmtDsex.run([d, dsexIdx, 180, 140, 60, 125000, 150000000, 4500.0]);
-      }
-      await new Promise((res, rej) => stmtDsex.finalize(err => err ? rej(err) : res()));
-      await dbRun('COMMIT');
-      console.log(`[SQLITE] Seeded ${allDates.length} 20-Year DSEX index benchmark timeline records.`);
-    }
-
-    // 2. Fetch all companies to seed price_history and fundamentals_history
-    const companies = await dbAll('SELECT * FROM company_fundamentals ORDER BY symbol ASC');
-    const compList = companies.length > 0 ? companies : [{ symbol: 'WONDERTOYS', name: 'Wonder Toys Ltd', sector: 'Equities', eps_basic: 2.5, nav_per_share: 22.0 }];
-
-    await dbRun('BEGIN TRANSACTION');
-    let priceStmt = dbPrepare(`
-      INSERT INTO price_history (symbol, date, close, ycp, change, change_percent, volume, pe)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(symbol, date) DO UPDATE SET
-        close = excluded.close,
-        ycp = excluded.ycp,
-        change = excluded.change,
-        change_percent = excluded.change_percent,
-        volume = excluded.volume,
-        pe = excluded.pe
-    `);
-
-    let fundStmt = dbPrepare(`
-      INSERT INTO fundamentals_history (symbol, fiscal_year, period, eps_basic, eps_diluted, nav_per_share, roe, dividend_yield, paid_up_capital_mn, authorized_capital_mn, pe_ratio, audit_status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(symbol, fiscal_year) DO NOTHING
-    `);
-
-    let totalPriceRecords = 0;
-    for (const c of compList) {
-      const sym = c.symbol;
-      const currentPrice = Number(c.ltp || c.close || 25 + (sym.charCodeAt(0) % 120));
-      const eps = Number(c.eps_basic || 3.0);
-      const navps = Number(c.nav_per_share || 25.0);
-      const pe = Number(c.pe_basic || 12.0);
-      const ipoYear = 2005 + (sym.charCodeAt(0) % 15);
-      const startPrice = Math.max(5.0, Number((currentPrice * (0.15 + ((sym.charCodeAt(sym.length - 1) % 40) / 100))).toFixed(2)));
-
-      const eligibleDates = allDates.filter(d => parseInt(d.slice(0, 4), 10) >= ipoYear);
-      let currentP = startPrice;
-      const priceStep = (currentPrice - startPrice) / Math.max(1, eligibleDates.length);
-
-      for (let i = 0; i < eligibleDates.length; i++) {
-        const date = eligibleDates[i];
-        const noise = (Math.sin(i * 0.1) * 0.03) + ((Math.random() - 0.48) * 0.02);
-        currentP = Math.max(1.0, currentP + priceStep + (currentP * noise));
-        if (i === eligibleDates.length - 1) currentP = currentPrice;
-
-        const close = Number(currentP.toFixed(2));
-        const ycp = Number((close / (1 + (noise || 0.01))).toFixed(2));
-        const change = Number((close - ycp).toFixed(2));
-        const change_percent = Number((ycp > 0 ? ((change / ycp) * 100) : 0).toFixed(2));
-        const volume = Math.floor(15000 + Math.random() * 350000);
-        const stockPe = Number((pe * (0.85 + (Math.sin(i * 0.05) * 0.25))).toFixed(2));
-
-        priceStmt.run([sym, date, close, ycp, change, change_percent, volume, stockPe]);
-        totalPriceRecords++;
-      }
-
-      // Seed 2005-2025 fundamentals
-      for (let yr = Math.max(2005, ipoYear); yr <= 2025; yr++) {
-        const factor = 0.5 + ((yr - 2005) / 20) * 0.5;
-        const yrEps = Number((eps * factor).toFixed(2));
-        const yrNav = Number((navps * factor).toFixed(2));
-        const yrRoe = Number((yrNav > 0 ? (yrEps / yrNav) * 100 : 12.0).toFixed(2));
-        fundStmt.run([sym, yr, 'Annual', yrEps, yrEps, yrNav, yrRoe, 5.0, 500, 1000, pe, 'Audited']);
-      }
-    }
-
-    await new Promise((res, rej) => priceStmt.finalize(err => err ? rej(err) : res()));
-    await new Promise((res, rej) => fundStmt.finalize(err => err ? rej(err) : res()));
-    await dbRun('COMMIT');
-    console.log(`[SQLITE] Auto-seed complete: Inserted ${totalPriceRecords} historical records across all listed symbols.`);
-  } catch (e) {
-    console.error('[SQLITE] autoSeed20YearHistory error:', e.message);
-  }
-}
-
 // In-Memory High-Speed Cache for Macro DSEX Trajectory (Refreshes hourly)
 let cachedDsexMap = null;
 let lastDsexFetchTime = 0;
@@ -1235,15 +895,9 @@ export async function getDetailedHistoricalAnalysis(symbol) {
     SELECT * FROM company_fundamentals WHERE symbol = ?
   `, [cleanSym]);
 
-  if (!rows || rows.length === 0) {
-    await seedStockHistoryOnDemand(cleanSym, fund);
-    rows = await dbAll(`
-      SELECT date, close as ltp, ycp, change, change_percent as changePercent, volume, pe
-      FROM price_history
-      WHERE symbol = ? AND date NOT LIKE '%T%' AND date NOT LIKE '%:%'
-      ORDER BY date ASC
-    `, [cleanSym]);
-  }
+  // No fabricated fallback -- a symbol with zero rows here genuinely has no
+  // history in the DB yet; the rest of this function already handles a sparse
+  // or empty `rows` honestly (see the frontend's "unavailable" states).
 
   if (!rows || rows.length === 0) {
     return null;
@@ -1459,46 +1113,22 @@ export async function getDetailedHistoricalAnalysis(symbol) {
     financialStatements = [];
   }
 
-  if (!financialStatements || financialStatements.length === 0) {
-    const baseEps = Number(fund?.eps_basic || eps || 3.5);
-    const baseNav = Number(fund?.nav_per_share || navps || 25.0);
-    const baseRoe = Number(fund?.roe || (baseNav > 0 ? (baseEps / baseNav) * 100 : 14.0));
-    const baseDiv = Number(fund?.dividend_yield || 3.5);
-    const basePe = Number(fund?.pe_basic || currentPe || 12.0);
-    const paidUp = Number(fund?.paid_up_capital_mn || 500.0);
-
-    financialStatements = [];
-    for (let yr = 2025; yr >= 2005; yr--) {
-      const age = 2025 - yr;
-      const factor = Math.max(0.35, 1 - (age * 0.032) + Math.sin(yr * 0.7) * 0.04);
-      const yrEps = Number(Math.max(0.1, baseEps * factor).toFixed(2));
-      const yrNav = Number(Math.max(10, baseNav * (0.45 + (1 - age / 25) * 0.55)).toFixed(2));
-      const yrRoe = Number(Math.max(4, yrNav > 0 ? (yrEps / yrNav) * 100 : baseRoe * factor).toFixed(2));
-      const yrDiv = Number(Math.max(1, baseDiv * (0.8 + Math.cos(yr) * 0.3)).toFixed(2));
-      const yrPe = Number(Math.max(5, basePe * (0.9 + Math.sin(yr * 0.5) * 0.2)).toFixed(2));
-      const yrPaidUp = Number(Math.max(100, paidUp * (0.5 + (1 - age / 30) * 0.5)).toFixed(2));
-
-      financialStatements.push({
-        year: yr,
-        period: 'Annual',
-        eps: yrEps,
-        navps: yrNav,
-        roe: yrRoe,
-        dividendYield: yrDiv,
-        pe: yrPe,
-        debtToEquity: fund?.debt_to_equity || 0.4,
-        currentRatio: fund?.current_ratio || 1.8,
-        paidUpCapital: yrPaidUp,
-        auditStatus: 'Audited'
-      });
-    }
-  }
+  // No fabricated fallback: a symbol with no real rows in fundamentals_history
+  // simply has no audited statements on file yet. The previous version here
+  // synthesized 20 years of fake EPS/NAV/ROE/dividend/P/E figures via sine-wave
+  // noise around a single base value and tagged the result `auditStatus:
+  // 'Audited'` -- asserting fabricated numbers were real audited disclosures.
+  // financialStatements stays [] here; the frontend already renders a "no
+  // audited statements available" state for that case.
 
   const analysisResult = {
     symbol: cleanSym,
     fullName: fund?.name || cleanSym,
-    sector: fund?.sector || 'Equities',
-    category: fund?.category || 'A',
+    // Unknown sector/category stays null rather than defaulting to a specific
+    // guess ('Equities'/'A') -- that would present an unverified classification
+    // as if it were the company's real, confirmed sector/category.
+    sector: fund?.sector || null,
+    category: fund?.category || null,
     currentPrice,
     closeDate: latestRow.date,
     ath: {

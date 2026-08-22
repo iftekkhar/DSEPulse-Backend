@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import {
   initDB,
   saveDailyClosingToDB,
+  saveSymbolHistoryBulk,
   saveFundamentals,
   saveFundamentalsDelta,
   saveFundamentalsBulkDelta,
@@ -22,15 +23,12 @@ import {
   getHistoricalTimeline,
   getDetailedHistoricalAnalysis,
   getCompanyFundamentalsHistory,
-  seed20YearFromMasterExcel,
-  seedFromLatestJson,
-  autoSeed20YearHistory,
   invalidateAnalysisCache,
   dbGet,
   dbRun,
   isSqliteAvailable
 } from './db.js';
-import { runAuditedEPSWeeklyScraper } from './scrapers/audited_eps_scraper.js';
+import { runAuditedEPSWeeklyScraper, scrapeCompanyAuditedFinancials } from './scrapers/audited_eps_scraper.js';
 
 let cron;
 try {
@@ -162,26 +160,30 @@ export async function fetchDSEClosingPrices() {
         const symbol = cols[1].toUpperCase().trim();
         const close = parseFloat(cols[2].replace(/,/g, ''));
         const ycp = parseFloat(cols[3].replace(/,/g, ''));
-        const high = cols[4] ? parseFloat(cols[4].replace(/,/g, '')) : close;
-        const low = cols[5] ? parseFloat(cols[5].replace(/,/g, '')) : close;
-        const volume = cols[6] ? parseInt(cols[6].replace(/,/g, ''), 10) : 0;
-        const value = cols[7] ? parseFloat(cols[7].replace(/,/g, '')) : 0;
+        // No 0 fallbacks: a column this row didn't have (or that failed to parse)
+        // stays null -- this feeds the permanent daily closing history, where a
+        // fabricated 0 volume/value/change is indistinguishable from a real one.
+        const high = cols[4] ? parseFloat(cols[4].replace(/,/g, '')) : null;
+        const low = cols[5] ? parseFloat(cols[5].replace(/,/g, '')) : null;
+        const volume = cols[6] ? parseInt(cols[6].replace(/,/g, ''), 10) : null;
+        const value = cols[7] ? parseFloat(cols[7].replace(/,/g, '')) : null;
 
         if (symbol && !isNaN(close) && close > 0) {
-          const change = !isNaN(ycp) && ycp > 0 ? Number((close - ycp).toFixed(2)) : 0;
-          const changePercent = !isNaN(ycp) && ycp > 0 ? Number(((change / ycp) * 100).toFixed(2)) : 0;
+          const hasYcp = !isNaN(ycp) && ycp > 0;
+          const change = hasYcp ? Number((close - ycp).toFixed(2)) : null;
+          const changePercent = hasYcp ? Number(((change / ycp) * 100).toFixed(2)) : null;
           records.push({
             symbol,
             close,
             closePrice: close,
-            ycp: !isNaN(ycp) ? ycp : null,
-            open: ycp || close,
-            high: !isNaN(high) ? high : close,
-            low: !isNaN(low) ? low : close,
+            ycp: hasYcp ? ycp : null,
+            open: hasYcp ? ycp : null,
+            high: !isNaN(high) ? high : null,
+            low: !isNaN(low) ? low : null,
             change,
             changePercent,
-            volume: !isNaN(volume) ? volume : 0,
-            value: !isNaN(value) ? value : 0
+            volume: !isNaN(volume) ? volume : null,
+            value: !isNaN(value) ? value : null
           });
         }
       }
@@ -242,93 +244,6 @@ export async function fetchDSELiveTicker() {
 }
 
 // Scrape individual company fundamentals from official DSE page
-export async function fetchDSEFundamentals(symbol) {
-  const cleanSym = (symbol || '').toUpperCase().trim();
-  if (!cleanSym) return null;
-
-  try {
-    const url = `https://dsebd.org/displayCompany.php?name=${encodeURIComponent(cleanSym)}`;
-    const res = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      httpsAgent,
-      timeout: 15000
-    });
-
-    const $ = cheerio.load(res.data);
-    const data = {
-      symbol: cleanSym,
-      name: '',
-      sector: '',
-      category: '',
-      epsBasic: null,
-      epsDiluted: null,
-      epsQuarterly: null,
-      navPerShare: null,
-      paidUpCapitalMn: null,
-      authorizedCapitalMn: null,
-      peBasic: null,
-      peDiluted: null,
-      peTrailing: null,
-      dividendYield: null,
-      auditedPeriod: null,
-      quarterlyDisclosure: null
-    };
-
-    $('table tr').each((_, tr) => {
-      const text = $(tr).text().replace(/\s+/g, ' ').trim();
-      const cols = $(tr).find('td, th').map((_, c) => $(c).text().replace(/\s+/g, ' ').trim()).get();
-
-      for (let i = 0; i < cols.length; i++) {
-        const col = cols[i];
-        if (col.includes('Authorized Capital (mn)') && cols[i + 1]) {
-          const num = parseFloat(cols[i + 1].replace(/,/g, ''));
-          if (!isNaN(num)) data.authorizedCapitalMn = num;
-        }
-        if (col.includes('Paid-up Capital (mn)') && cols[i + 1]) {
-          const num = parseFloat(cols[i + 1].replace(/,/g, ''));
-          if (!isNaN(num)) data.paidUpCapitalMn = num;
-        }
-        if (col.includes('Sector') && cols[i + 1]) {
-          data.sector = cols[i + 1];
-        }
-      }
-
-      if (text.includes('Basic EPS') && text.includes('P/E')) {
-        const nums = text.match(/[-+]?\d*\.?\d+/g);
-        if (nums && nums.length > 0) {
-          const val = parseFloat(nums[0]);
-          if (!isNaN(val) && data.peBasic === null) data.peBasic = val;
-        }
-      }
-
-      if (text.includes('Trailing P/E Ratio')) {
-        const nums = text.match(/[-+]?\d*\.?\d+/g);
-        if (nums && nums.length > 0) {
-          const val = parseFloat(nums[0]);
-          if (!isNaN(val)) data.peTrailing = val;
-        }
-      }
-
-      // Historical Audited Table (Year, EPS, NAV Per Share)
-      if (cols.length >= 5 && cols[0].match(/^(19|20)\d{2}$/)) {
-        const year = cols[0];
-        const nums = cols.slice(1).map(c => parseFloat(c.replace(/,/g, ''))).filter(n => !isNaN(n));
-        if (nums.length >= 2) {
-          data.auditedPeriod = `FY${year} Audited`;
-          if (data.epsBasic === null) data.epsBasic = nums[0];
-          if (data.navPerShare === null && nums[1]) data.navPerShare = nums[1];
-        }
-      }
-    });
-
-    return data;
-  } catch (err) {
-    return null;
-  }
-}
-
 // Scrape macro market breadth & DSEX index from dsebd.org homepage
 export async function fetchMarketBreadthFromDSE() {
   try {
@@ -341,18 +256,23 @@ export async function fetchMarketBreadthFromDSE() {
     });
 
     const $ = cheerio.load(res.data);
+    // Every field starts null, not 0 -- 0 asserts "confirmed zero", which is wrong
+    // for a field this function never even attempts to extract (totalTrades,
+    // totalVolume have no regex below) and equally wrong for one whose regex just
+    // didn't match this time. Only a field this function actually parsed off the
+    // page gets a real number.
     const breadth = {
-      advancing: 0,
-      declining: 0,
-      unchanged: 0,
-      totalTrades: 0,
-      totalVolume: 0,
-      totalValueMn: 0,
-      dsexIndex: 0
+      advancing: null,
+      declining: null,
+      unchanged: null,
+      totalTrades: null,
+      totalVolume: null,
+      totalValueMn: null,
+      dsexIndex: null
     };
 
     const text = $('body').text();
-    
+
     // Extract DSEX Index
     const dsexMatch = text.match(/DSEX\s+([\d,.]+)/i);
     if (dsexMatch) breadth.dsexIndex = parseFloat(dsexMatch[1].replace(/,/g, ''));
@@ -370,6 +290,11 @@ export async function fetchMarketBreadthFromDSE() {
     // Extract Turnover Value
     const valMatch = text.match(/Total\s+Value\s+\(mn\)[:\s]+([\d,.]+)/i) || text.match(/Turnover[:\s]+([\d,.]+)\s+mn/i);
     if (valMatch) breadth.totalValueMn = parseFloat(valMatch[1].replace(/,/g, ''));
+
+    // totalTrades / totalVolume: no extraction pattern exists for these on this
+    // page today -- they stay null (honest "not available") rather than a
+    // permanent fabricated 0. A real extractor can be added later if/when a
+    // reliable source pattern for them is found.
 
     return breadth;
   } catch (err) {
@@ -421,16 +346,18 @@ export async function runJob1ClosingPrices() {
     }
     
     const liveBreadth = await fetchMarketBreadthFromDSE();
-    const dsexClose = liveBreadth?.dsexIndex || 5450.0;
-    
+    // No hardcoded fallback numbers -- if a real value isn't available from either the
+    // scraped closing records or the live breadth scrape, persist null, not a guess.
+    const dsexClose = liveBreadth?.dsexIndex ?? null;
+
     await saveDSEXDailyClosing({
       dsexIndex: dsexClose,
       advancing,
       declining,
       unchanged,
-      totalTrades: liveBreadth?.totalTrades || 140000,
-      totalVolume: totalVol || liveBreadth?.totalVolume || 180000000,
-      totalValueMn: totalVal || liveBreadth?.totalValueMn || 5800.0
+      totalTrades: liveBreadth?.totalTrades ?? null,
+      totalVolume: totalVol || liveBreadth?.totalVolume || null,
+      totalValueMn: totalVal || liveBreadth?.totalValueMn || null
     }, todayDhakaStr);
     
     if (savedCount > 0) invalidateStocksCache();
@@ -535,8 +462,10 @@ export async function runJob3DailyFundamentalsDelta() {
 
       await Promise.all(batch.map(async (sym) => {
         try {
-          const data = await fetchDSEFundamentals(sym);
-          if (data && data.epsBasic !== null) {
+          // scrapeCompanyAuditedFinancials already returns null when epsBasic isn't found,
+          // so no separate null-check on data.epsBasic is needed here.
+          const data = await scrapeCompanyAuditedFinancials(sym);
+          if (data) {
             scrapedList.push(data);
           } else {
             totalUnchanged++;
@@ -742,13 +671,10 @@ app.post('/api/jobs/breadth', async (req, res) => {
 app.get('/api/market-pulse', async (req, res) => {
   try {
     const snapshot = await getIntradayBreadthSnapshot();
-    res.json(snapshot || {
-      advancing: 165,
-      declining: 148,
-      unchanged: 67,
-      dsex_index: 5450.25,
-      total_value_mn: 5820.40
-    });
+    // No hardcoded fallback snapshot -- if there's no real one yet (e.g. before
+    // Job 4's first run of the day), return null honestly rather than a fake
+    // "165 advancing, DSEX 5450.25" market state presented as if it were live.
+    res.json(snapshot || null);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch market pulse' });
   }
@@ -758,16 +684,7 @@ app.get('/api/market-pulse', async (req, res) => {
 app.get('/api/market-breadth', async (req, res) => {
   try {
     const snapshot = await getIntradayBreadthSnapshot();
-    res.json(snapshot || {
-      slot_time: '15:00:00',
-      advancing: 165,
-      declining: 148,
-      unchanged: 67,
-      total_trades: 142580,
-      total_volume: 185420100,
-      total_value_mn: 5820.40,
-      dsex_index: 5450.25
-    });
+    res.json(snapshot || null);
   } catch (err) {
     console.error('Error fetching market breadth snapshot:', err.message);
     res.status(500).json({ error: 'Failed to fetch market breadth' });
@@ -907,21 +824,29 @@ app.post('/api/ingest/live', requireIngestAuth, async (req, res) => {
   }
   try {
     const tradeDate = date || new Date().toISOString().slice(0, 10);
-    let closingIngested = 0;
-    for (const stock of stocks) {
-      if (stock.symbol && stock.ltp !== null && stock.ltp !== undefined) {
-        await saveDailyClosingToDB(stock.symbol, {
-          date: tradeDate,
-          close: Number(stock.ltp),
-          ycp: Number(stock.ycp || stock.ltp),
-          change: Number(stock.change || 0),
-          changePercent: Number(stock.changePercent || 0),
-          volume: Number(stock.volume || 0),
-          pe: stock.pe !== null && stock.pe !== undefined ? Number(stock.pe) : null
-        });
-        closingIngested++;
-      }
-    }
+    // saveDailyClosingToDB(records, dateStr) takes an ARRAY of records for one
+    // shared date, not (symbol, record) -- the previous per-stock loop called it as
+    // saveDailyClosingToDB(stock.symbol, {...}), a string where an array was
+    // required. Array.isArray(stock.symbol) is false, so the function's own guard
+    // returned 0 and wrote nothing, silently, on every single call -- this endpoint
+    // has never actually saved a closing price. Building one array and calling it
+    // once (its real designed use: many symbols, one date) both fixes that and
+    // avoids one transaction per stock, the same fix applied to /api/ingest/history
+    // earlier.
+    const closingRecords = stocks
+      .filter(s => s.symbol && s.ltp !== null && s.ltp !== undefined)
+      .map(s => ({
+        symbol: s.symbol,
+        close: Number(s.ltp),
+        // No 0 fallbacks: preserve null for anything the snapshot didn't actually
+        // have rather than asserting a fabricated "no change"/"zero volume".
+        ycp: s.ycp !== null && s.ycp !== undefined ? Number(s.ycp) : null,
+        change: s.change !== null && s.change !== undefined ? Number(s.change) : null,
+        changePercent: s.changePercent !== null && s.changePercent !== undefined ? Number(s.changePercent) : null,
+        volume: s.volume !== null && s.volume !== undefined ? Number(s.volume) : null,
+        pe: s.pe !== null && s.pe !== undefined ? Number(s.pe) : null
+      }));
+    const closingIngested = await saveDailyClosingToDB(closingRecords, tradeDate);
 
     if (marketBreadth) {
       await saveIntradayBreadthSnapshot(marketBreadth);
@@ -929,11 +854,11 @@ app.post('/api/ingest/live', requireIngestAuth, async (req, res) => {
         await saveDSEXDailyClosing({
           date: tradeDate,
           dsexIndex: marketBreadth.dsexIndex,
-          advancing: marketBreadth.advancing || 0,
-          declining: marketBreadth.declining || 0,
-          unchanged: marketBreadth.unchanged || 0,
-          turnoverMn: marketBreadth.turnoverMn || 0,
-          volume: marketBreadth.totalVolume || 0
+          advancing: marketBreadth.advancing ?? null,
+          declining: marketBreadth.declining ?? null,
+          unchanged: marketBreadth.unchanged ?? null,
+          turnoverMn: marketBreadth.turnoverMn ?? null,
+          volume: marketBreadth.totalVolume ?? null
         });
       }
     }
@@ -1001,7 +926,10 @@ app.post('/api/ingest/fundamentals', requireIngestAuth, async (req, res) => {
           s.debtToEquity !== undefined ? Number(s.debtToEquity) : null,
           s.currentRatio !== undefined ? Number(s.currentRatio) : null,
           s.paidUpCapital !== undefined ? Number(s.paidUpCapital) : null,
-          s.auditStatus || 'Audited'
+          // Never default an unspecified audit status to 'Audited' -- that's a
+          // verification claim, not a structural label, and asserting it by
+          // default would falsely certify data whose provenance wasn't stated.
+          s.auditStatus || null
         ]);
       }
     }
@@ -1025,21 +953,12 @@ app.post('/api/ingest/history', requireIngestAuth, async (req, res) => {
   }
   try {
     const cleanSym = symbol.toUpperCase().trim();
-    let count = 0;
-    for (const h of history) {
-      if (h.date && h.close) {
-        await saveDailyClosingToDB(cleanSym, {
-          date: h.date,
-          close: Number(h.close ?? h.ltp ?? 0),
-          ycp: Number(h.ycp ?? h.close ?? 0),
-          change: Number(h.change || 0),
-          changePercent: Number(h.changePercent || 0),
-          volume: Number(h.volume || 0),
-          pe: h.pe !== null && h.pe !== undefined ? Number(h.pe) : null
-        });
-        count++;
-      }
-    }
+    // saveSymbolHistoryBulk writes this symbol's whole history in ONE transaction.
+    // The previous version called saveDailyClosingToDB (its own BEGIN/COMMIT per
+    // call) once per row -- fine for Job 1's "one date, many symbols" case, but for
+    // "one symbol, thousands of dates" it meant thousands of separate commits per
+    // request, slow enough to time out the pipeline promoter mid-symbol.
+    const count = await saveSymbolHistoryBulk(cleanSym, history);
     invalidateStocksCache();
     res.json({ status: 'success', symbol: cleanSym, insertedCount: count });
   } catch (err) {
@@ -1056,17 +975,29 @@ app.post('/api/ingest/dsex', requireIngestAuth, async (req, res) => {
   }
   try {
     let count = 0;
+    // saveDSEXDailyClosing(data, dateStr) takes the date as a SEPARATE second argument,
+    // not as a property of `data` -- passing it inside the object (as this used to) left
+    // dateStr undefined, so every call fell back to today's date and repeatedly
+    // overwrote a single row instead of writing each historical date. Field names must
+    // also match what the function reads (totalTrades/totalVolume/totalValueMn), not
+    // turnoverMn/volume, which it silently ignores.
+    // Preserve null for anything the source record didn't actually have (e.g. the
+    // Kaggle-sourced index history has a real dsexIndex but no breadth figures at
+    // all) -- coercing a missing field to 0 before it reaches saveDSEXDailyClosing
+    // would defeat that function's own null-handling and write a fabricated
+    // "confirmed zero" into permanent history for a field that was never scraped.
+    const numOrNull = (v) => (v === null || v === undefined ? null : Number(v));
     for (const r of records) {
       if (r.date && (r.dsexIndex || r.dsex_index)) {
         await saveDSEXDailyClosing({
-          date: r.date,
           dsexIndex: Number(r.dsexIndex ?? r.dsex_index),
-          advancing: Number(r.advancing || 0),
-          declining: Number(r.declining || 0),
-          unchanged: Number(r.unchanged || 0),
-          turnoverMn: Number(r.turnoverMn ?? r.total_value_mn ?? 0),
-          volume: Number(r.volume ?? r.total_volume ?? 0)
-        });
+          advancing: numOrNull(r.advancing),
+          declining: numOrNull(r.declining),
+          unchanged: numOrNull(r.unchanged),
+          totalTrades: numOrNull(r.totalTrades ?? r.total_trades),
+          totalVolume: numOrNull(r.volume ?? r.total_volume),
+          totalValueMn: numOrNull(r.turnoverMn ?? r.total_value_mn)
+        }, r.date);
         count++;
       }
     }
@@ -1121,16 +1052,13 @@ if (fs.existsSync(DIST_DIR)) {
   });
 }
 
-// Auto-boot SQLite DB Initialization & Seeding on Start
+// Auto-boot SQLite DB Initialization on Start
+// No auto-seeding here on purpose -- every row in this DB must come from a real
+// DSE/LankaBangla scrape via the pipeline's audited promotion process, never from
+// a bundled fallback dataset. If the DB is empty, the API honestly returns empty,
+// which the frontend already handles (loading/empty states, no fake data).
 async function startServer() {
   await initDB();
-  try {
-    await seedFromLatestJson();
-    await autoSeed20YearHistory();
-    await seed20YearFromMasterExcel();
-  } catch (e) {
-    console.warn('[BOOT SEED NOTICE]', e.message);
-  }
 
   const PORT = process.env.PORT || 5001;
   app.listen(PORT, () => {
