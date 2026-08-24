@@ -248,7 +248,7 @@ export class DataAuditor {
     const declining = numOrNull(snapshot.declining);
     const unchanged = numOrNull(snapshot.unchanged);
     // The exact hardcoded output of the deleted pipeline/src/builders/dsex_builder.js
-    // fabrication generator -- a permanent regression guard, see AUDIT_RULES.md.
+    // fabrication generator -- a permanent regression guard, see ARCHITECTURE.md.
     if (advancing === 180 && declining === 140 && unchanged === 60) {
       errors.push('Breadth matches the known dsex_builder.js fabrication signature (advancing=180, declining=140, unchanged=60)');
     }
@@ -312,5 +312,34 @@ export class DataAuditor {
         total_shares: (totalShares !== null && totalShares > 0) ? totalShares : null,
       }
     };
+  }
+
+  // Shareholding pattern (2026-08-24) -- each category must be a plausible
+  // 0-100 percentage, and the five must sum to ~100% (DSE rounds each
+  // category to 2dp, so a few hundredths of drift is normal rounding, not a
+  // parsing bug -- the tolerance below is deliberately generous at 1.0 to
+  // absorb that without masking a real mis-parse, e.g. reading the wrong
+  // <td> and getting a materially wrong sum).
+  static auditShareholdingRecord(symbol, snapshot = {}) {
+    const errors = [];
+    const warnings = [];
+    const fields = ['sponsorPct', 'govtPct', 'institutePct', 'foreignPct', 'publicPct'];
+
+    for (const f of fields) {
+      const v = numOrNull(snapshot[f]);
+      if (v === null) {
+        errors.push(`${symbol}: shareholding.${f} is missing/unparseable`);
+      } else if (v < 0 || v > 100) {
+        errors.push(`${symbol}: shareholding.${f} = ${v} is outside the plausible 0-100% range`);
+      }
+    }
+    if (errors.length === 0) {
+      const sum = fields.reduce((acc, f) => acc + Number(snapshot[f]), 0);
+      if (Math.abs(sum - 100) > 1.0) {
+        errors.push(`${symbol}: shareholding categories sum to ${sum.toFixed(2)}%, expected ~100%`);
+      }
+    }
+
+    return { passed: errors.length === 0, errors, warnings };
   }
 }

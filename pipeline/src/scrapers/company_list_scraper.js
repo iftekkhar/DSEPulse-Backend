@@ -1,10 +1,20 @@
 /**
  * company_list_scraper.js
  *
- * Scrapes ALL currently active/listed symbols from dsebd.org.
- * - Source: https://www.dsebd.org/latest_share_price_scroll_l.php
- * - Only imports symbols ACTIVE TODAY (is_active = 1)
- * - De-listed or suspended instruments are excluded
+ * Scrapes the full active instrument roster from dsebd.org -- equities,
+ * bonds/T-bills, and mutual funds all in scope (2026-08-22 decision).
+ * - Source: https://www.dsebd.org/day_end_archive.php, queried once for ALL
+ *   instruments over a rolling 30-day window (not a single day's snapshot --
+ *   a stock that simply didn't trade on scrape day would be silently excluded
+ *   by that; verified against real DSE data on 2026-08-22 that this isn't
+ *   hypothetical, it's how the archive is actually structured).
+ * - is_active = 1 means "traded at least once in the last 30 days" -- a
+ *   symbol absent from that window this run is marked is_active = 0.
+ * - This table is the roster only: symbol/name/sector/category/face_value/
+ *   total_shares/is_active. It never holds market_cap_mn or
+ *   paid_up_capital_mn -- those are pricing/fundamentals-derived figures that
+ *   belong exclusively to fundamentals_scraper.js (which sources the price
+ *   side from stg_price_history's real year-end close), not to this scraper.
  * - Produces data/active_symbols.json for use by all other pipeline modules
  * - Detail fetches (fetchDetails: true) are resumable and batched (6 concurrent,
  *   250ms between batches) -- see shared/dse_http_client.js
@@ -26,59 +36,57 @@ const DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const SYMBOLS_FILE = path.join(DATA_DIR, 'active_symbols.json');
 
 /**
- * Fetch and parse ALL active DSE symbols from the latest share price page.
- * Returns an array of { symbol, name, ltp, category } objects.
+ * Fetch every instrument (equity, bond/T-bill, or mutual fund) that traded at
+ * least once in the last 30 days from DSE's day_end_archive, across ALL
+ * instruments in a single request -- not a single day's snapshot (a stock
+ * that simply didn't trade on scrape day would be silently excluded by that)
+ * and not one request per symbol.
+ * Returns a plain array of symbol strings. No price is fetched here -- market
+ * cap is a pricing-derived figure and belongs entirely to
+ * fundamentals_scraper.js (which already sources it from stg_price_history's
+ * real year-end close, not from this scraper); this function's only job is
+ * "which equities exist and are currently active."
  */
 async function fetchActiveSymbolsFromDSE() {
-  const url = 'https://www.dsebd.org/latest_share_price_scroll_l.php';
-  console.log(`[CompanyList] Fetching active symbol list from: ${url}`);
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const monthAgo = new Date();
+  monthAgo.setDate(monthAgo.getDate() - 30);
+  const startStr = monthAgo.toISOString().slice(0, 10);
+  const endStr = yesterday.toISOString().slice(0, 10);
+
+  const url = `https://www.dsebd.org/day_end_archive.php?startDate=${startStr}&endDate=${endStr}&inst=${encodeURIComponent('All Instrument')}&archive=data`;
+  console.log(`[CompanyList] Fetching 30-day traded-instrument archive from DSE: ${startStr} -> ${endStr}`);
 
   let html;
   try {
-    const res = await fetchWithRetry(url, { timeout: 30000, attempts: 3, backoffMs: 3000 });
+    const res = await fetchWithRetry(url, { timeout: 45000, attempts: 3, backoffMs: 3000 });
     html = res.data;
   } catch (err) {
-    throw new Error(`Failed to fetch company list after 3 attempts: ${err.message}`);
+    throw new Error(`Failed to fetch 30-day archive after 3 attempts: ${err.message}`);
   }
 
   const $ = cheerio.load(html);
-  const symbols = new Map();
+  const symbols = new Set();
 
-  // Parse from the main data table (table#shareTable or similar)
-  // The DSE page has a table with columns: #, Trade Code, LTP, High, Low, CLOSEP, YCP, CHANGE, %CHANGE, VOLUME, VALUE, TRADES
   $('table').each((_, table) => {
     $(table).find('tr').each((_, row) => {
-      const cells = $(row).find('td');
-      if (cells.length < 2) return;
+      const cellVals = $(row).find('td').map((_, c) => $(c).text().replace(/\s+/g, ' ').trim()).get();
+      if (cellVals.length < 8) return;
 
-      const symbolCell = $(cells[1]).text().trim();
-      if (!symbolCell || symbolCell.includes('Trade Code') || symbolCell.length > 15) return;
+      // Same 12-column shape as gap_scraper.js's day_end_archive parsing:
+      // # (0) | DATE (1) | CODE (2) | LTP (3) | HIGH (4) | LOW (5) | OPENP (6) | CLOSEP (7) | YCP (8) | TRADE (9) | VALUE (10) | VOLUME (11)
+      const dateRaw = cellVals[1];
+      if (!dateRaw || !/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) return;
 
-      // Extract symbol from text or anchor href (preserving special characters like (PRAN) and &QUE)
-      const anchor = $(cells[1]).find('a');
-      const href = anchor.attr('href') || '';
-      let symbol = '';
-      if (href.includes('name=')) {
-        const rawParam = href.split('name=')[1];
-        if (rawParam.startsWith('KAY&QUE') || rawParam.startsWith('KAY%26QUE')) {
-          symbol = 'KAY&QUE';
-        } else {
-          symbol = decodeURIComponent(rawParam.split('&')[0]).trim();
-        }
-      }
-      if (!symbol) {
-        symbol = symbolCell.split(/[\s\t\n]/)[0].trim();
-      }
-      symbol = symbol.toUpperCase().replace(/\s+/g, '');
+      const symbol = cellVals[2].toUpperCase().trim();
+      if (!symbol || symbol.length > 20) return;
 
-      if (!symbol || symbol.length === 0 || symbol.includes('TRADE') || symbol.length > 20) return;
-
-      const ltp = numOrNull($(cells[2]).text().trim());
-      symbols.set(symbol, { symbol, ltp });
+      symbols.add(symbol);
     });
   });
 
-  return Array.from(symbols.values());
+  return Array.from(symbols);
 }
 
 /**
@@ -152,15 +160,15 @@ export async function scrapeCompanyList({ fetchDetails = false, resume = true } 
   await initStagingDB();
   const now = new Date().toISOString();
 
-  // 1. Get active symbol list from DSE
+  // 1. Get every equity that traded in the last 30 days from DSE
   const activeSymbols = await fetchActiveSymbolsFromDSE();
-  console.log(`[CompanyList] Found ${activeSymbols.length} active symbols on DSE today.`);
+  console.log(`[CompanyList] Found ${activeSymbols.length} instruments traded on DSE in the last 30 days.`);
 
   // 2. Mark all existing records as inactive (fresh start for today)
   await dbRun(`UPDATE stg_company_list SET is_active = 0`);
 
   // 3. Determine which symbols actually need a detail fetch this run
-  let symbolsToFetch = activeSymbols.map(s => s.symbol);
+  let symbolsToFetch = activeSymbols.slice();
   if (fetchDetails && resume) {
     const existingRows = await dbAll(`SELECT symbol FROM stg_company_list WHERE name IS NOT NULL`);
     const existingSet = new Set(existingRows.map(r => r.symbol));
@@ -187,24 +195,52 @@ export async function scrapeCompanyList({ fetchDetails = false, resume = true } 
   }
 
   // 5. Insert/update every active symbol (fast DB writes; no HTTP call in this loop)
+  // No market_cap_mn here -- it's a pricing-derived figure and belongs to
+  // fundamentals_scraper.js, which already computes it from stg_price_history's
+  // real year-end close (confirmed 2026-08-22: this column was write-only,
+  // never read by anything downstream -- company_list's job is "which equities
+  // exist and are active," not market cap).
   const results = [];
   let blockedCount = 0;
-  for (const { symbol, ltp } of activeSymbols) {
+  for (const symbol of activeSymbols) {
     const details = detailsMap.get(symbol) || { name: null, sector: null, category: null, face_value: null, total_shares: null };
 
     // Audit gate before the INSERT -- rejects a negative/zero face_value or
     // total_shares outright; a genuinely-unknown one is already null by this point.
     const audit = DataAuditor.auditCompanyListRecord({ symbol, ...details });
     if (!audit.passed) {
-      console.warn(`[CompanyList] BLOCKED ${symbol} by audit:`, audit.errors);
+      console.warn(`[CompanyList] BLOCKED ${symbol} detail fields by audit (symbol stays active, no bad field written):`, audit.errors);
       blockedCount++;
+      // is_active must NOT be collateral damage of a rejected detail record.
+      // `symbol` reaching this point already means DSE's day_end_archive (an
+      // independent, unrelated data source -- see fetchActiveSymbolsFromDSE)
+      // confirmed it traded within the last 30 days; the audit failure above is
+      // about one specific detail field DSE's OWN company page published as
+      // invalid (e.g. a real "Face/par Value: 0.0" on DSE's own page for some
+      // debentures), not about whether the symbol is actually trading. Found
+      // 2026-08-24: the `UPDATE ... SET is_active = 0` reset a few lines above
+      // runs unconditionally for every symbol, and a `continue` here used to
+      // skip the write that would set it back to 1 -- so a real, actively
+      // traded symbol with one bad detail field silently flipped to inactive
+      // every time this ran. This minimal upsert only ever touches
+      // is_active/fetched_at; it never writes a NULL over an existing good
+      // detail value (nothing here is in the SET clause) and never writes the
+      // rejected bad field at all.
+      await dbRun(`
+        INSERT INTO stg_company_list (symbol, name, sector, category, face_value, total_shares, is_active, fetched_at)
+        VALUES (?, NULL, NULL, NULL, NULL, NULL, 1, ?)
+        ON CONFLICT(symbol) DO UPDATE SET
+          is_active=1,
+          fetched_at=excluded.fetched_at
+      `, [symbol, now]);
+      results.push({ symbol, name: null, sector: null, category: null, face_value: null, total_shares: null, is_active: 1 });
       continue;
     }
     const clean = audit.cleaned;
 
     await dbRun(`
-      INSERT INTO stg_company_list (symbol, name, sector, category, face_value, total_shares, market_cap_mn, is_active, fetched_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+      INSERT INTO stg_company_list (symbol, name, sector, category, face_value, total_shares, is_active, fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?)
       ON CONFLICT(symbol) DO UPDATE SET
         name=COALESCE(excluded.name, stg_company_list.name),
         sector=COALESCE(excluded.sector, stg_company_list.sector),
@@ -213,8 +249,7 @@ export async function scrapeCompanyList({ fetchDetails = false, resume = true } 
         total_shares=COALESCE(excluded.total_shares, stg_company_list.total_shares),
         is_active=1,
         fetched_at=excluded.fetched_at
-    `, [clean.symbol, clean.name, clean.sector, clean.category, clean.face_value, clean.total_shares,
-        (ltp !== null && clean.total_shares !== null) ? (ltp * clean.total_shares / 1e6) : null, now]);
+    `, [clean.symbol, clean.name, clean.sector, clean.category, clean.face_value, clean.total_shares, now]);
 
     results.push({ symbol, ...details, is_active: 1 });
   }

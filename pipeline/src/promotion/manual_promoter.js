@@ -3,7 +3,9 @@ import { runFullStagingAudit } from '../audit/audit_runner.js';
 import {
   publishStockHistory,
   publishCompanyFundamentals,
-  publishDSEXHistory
+  publishDSEXHistory,
+  publishCompanyList,
+  publishShareholding
 } from '../sync/publisher.js';
 
 /**
@@ -55,7 +57,10 @@ export async function promoteStagingToMainDB(explicitConfirm = false) {
       declining: r.declining ?? null,
       unchanged: r.unchanged ?? null,
       turnoverMn: r.total_value_mn ?? null,
-      volume: r.total_volume ?? null
+      volume: r.total_volume ?? null,
+      // Uniformly STAGING_DB now, not the granular staging-internal tier --
+      // see the price_history mapping above and shared/source_tiers.js.
+      source: 'STAGING_DB'
     }));
     console.log(`Promoting ${mappedDsex.length} DSEX historical sessions to Main DB...`);
     await publishDSEXHistory(mappedDsex);
@@ -63,17 +68,23 @@ export async function promoteStagingToMainDB(explicitConfirm = false) {
   }
 
   // 3. Promote Staged Price History
-  // Mapped onto /api/ingest/history's expected shape: {date, close, ycp, change, changePercent, volume, pe}
-  // `?? null` throughout, not `|| 0`: this was previously coercing every genuinely
-  // unknown volume/change/changePercent into a fabricated "confirmed zero" before
-  // it ever reached saveSymbolHistoryBulk's own (correct) null-preserving logic --
-  // silently re-introducing the fabricated-zero-volume bug on every future
-  // promotion run, even after the existing rows were patched once by hand.
+  // Mapped onto /api/ingest/history's expected shape. `?? null` throughout,
+  // not `|| 0`: this was previously coercing every genuinely unknown
+  // volume/change/changePercent into a fabricated "confirmed zero" before it
+  // ever reached saveSymbolHistoryBulk's own (correct) null-preserving logic.
+  // Now includes open/high/low/valueMn too (2026-08-23) -- these existed in
+  // stg_price_history all along but were never mapped through, so main DB's
+  // price_history had never stored real OHLC/turnover data at all, only
+  // close. Every field here is passed through exactly as staging has it --
+  // per policy, this table must match staging 100%, cell for cell.
   const priceRows = await dbAll('SELECT * FROM stg_price_history ORDER BY symbol, trade_date ASC');
   const priceSymbolsMap = new Map();
   for (const r of priceRows) {
     const mapped = {
       date: r.trade_date,
+      open: r.open ?? null,
+      high: r.high ?? null,
+      low: r.low ?? null,
       close: r.close,
       // `?? null`, not `?? r.close`: defaulting yesterday's close to today's close
       // when genuinely unknown silently fabricates "0% change" downstream (close -
@@ -82,7 +93,14 @@ export async function promoteStagingToMainDB(explicitConfirm = false) {
       change: r.change_amt ?? null,
       changePercent: r.change_pct ?? null,
       volume: r.volume ?? null,
-      pe: null
+      valueMn: r.value_mn ?? null,
+      pe: null,
+      // Every promotion run tags STAGING_DB uniformly now (staging itself is
+      // Tier 1 for main DB's purposes) rather than forwarding the granular
+      // staging-internal tier (DSE_SCRAPE/LANKABD/etc.) -- see
+      // shared/source_tiers.js. That granular tier still matters and is still
+      // tracked, just inside stg_price_history, not in main DB.
+      source: 'STAGING_DB'
     };
     if (!priceSymbolsMap.has(r.symbol)) priceSymbolsMap.set(r.symbol, []);
     priceSymbolsMap.get(r.symbol).push(mapped);
@@ -105,6 +123,7 @@ export async function promoteStagingToMainDB(explicitConfirm = false) {
       navps: r.navps,
       roe: r.roe,
       dividendYield: r.dividend_yield,
+      dps: r.dps,
       pe: r.pe_ratio,
       paidUpCapital: r.paid_up_capital_mn,
       auditStatus: 'Audited'
@@ -115,31 +134,65 @@ export async function promoteStagingToMainDB(explicitConfirm = false) {
 
   for (const [sym, stmts] of fundSymbolsMap.entries()) {
     console.log(`Promoting ${stmts.length} audited statements for ${sym}...`);
-    // stmts[0] is the latest fiscal year (ordered DESC) — use it to also
-    // refresh the symbol's "current" fundamentals snapshot, not just history.
-    // auditedPeriod MUST be included here: server/db.js's saveFundamentals only
-    // replaces period-coupled fields (like navPerShare) atomically when it can see
-    // the incoming audited_period differs from what's stored -- without it, a
-    // genuinely-null field (e.g. this year's NAVPS not yet disclosed by DSE) falls
-    // back to preserving whatever the OLD fiscal year's value was, silently tagging
-    // a prior year's number as if it belonged to the current one.
-    const latest = stmts[0] || {};
-    const fundamentalsSnapshot = {
-      eps: latest.eps ?? null,
-      navPerShare: latest.navps ?? null,
-      peBasic: latest.pe ?? null,
-      dividendYield: latest.dividendYield ?? null,
-      paidUpCapital: latest.paidUpCapital ?? null,
-      auditedPeriod: latest.year ? `FY${latest.year} Audited` : null
-    };
-    await publishCompanyFundamentals(sym, fundamentalsSnapshot, stmts);
+    // "Current" is no longer a separate write -- server/db.js derives it from
+    // each symbol's latest fiscal_year row in fundamentals_history directly
+    // (company_fundamentals dropped 2026-08-23, see ARCHITECTURE.md), so
+    // there's nothing left to compute/send here beyond the statements
+    // themselves.
+    await publishCompanyFundamentals(sym, stmts);
   }
   console.log(`  \x1b[32m✔ SUCCESS\x1b[0m Promoted audited statements across ${fundSymbolsMap.size} companies.`);
+
+  // 5. Promote the full company/instrument roster (added 2026-08-23)
+  const companyRows = await dbAll('SELECT * FROM stg_company_list ORDER BY symbol ASC');
+  if (companyRows.length > 0) {
+    const mappedCompanies = companyRows.map(r => ({
+      symbol: r.symbol,
+      name: r.name,
+      sector: r.sector,
+      category: r.category,
+      listing_date: r.listing_date,
+      face_value: r.face_value,
+      total_shares: r.total_shares,
+      market_cap_mn: r.market_cap_mn,
+      is_active: r.is_active,
+      fetched_at: r.fetched_at
+    }));
+    console.log(`Promoting ${mappedCompanies.length} company list entries...`);
+    const result = await publishCompanyList(mappedCompanies);
+    console.log(`  \x1b[32m✔ SUCCESS\x1b[0m Promoted company_list: ${result.upserted} upserted, ${result.pruned} pruned.`);
+  }
+
+  // 6. Promote shareholding snapshots (current + prior-disclosed-month only,
+  // added 2026-08-24 -- see stg_shareholding_current's own comment). Reshaped
+  // into the { symbol, shareholding: { current, previous } } payload
+  // /api/ingest/shareholding (and saveShareholdingCurrent underneath it)
+  // already expects -- the exact same shape server/'s own live scraper path
+  // produces, so both promotion routes into this table share one write path.
+  const shRows = await dbAll('SELECT * FROM stg_shareholding_current');
+  if (shRows.length > 0) {
+    const mappedShareholding = shRows.map(r => ({
+      symbol: r.symbol,
+      shareholding: {
+        current: {
+          asOfDate: r.as_of_date, sponsorPct: r.sponsor_pct, govtPct: r.govt_pct,
+          institutePct: r.institute_pct, foreignPct: r.foreign_pct, publicPct: r.public_pct,
+        },
+        previous: r.prev_as_of_date ? {
+          asOfDate: r.prev_as_of_date, sponsorPct: r.prev_sponsor_pct, govtPct: r.prev_govt_pct,
+          institutePct: r.prev_institute_pct, foreignPct: r.prev_foreign_pct, publicPct: r.prev_public_pct,
+        } : null,
+      },
+    }));
+    console.log(`Promoting ${mappedShareholding.length} shareholding snapshots...`);
+    const shResult = await publishShareholding(mappedShareholding);
+    console.log(`  \x1b[32m✔ SUCCESS\x1b[0m Promoted shareholding: ${shResult.saved} saved.`);
+  }
 
   console.log('\n======================================================');
   console.log('   PROMOTION COMPLETED SUCCESSFULLY');
   console.log('   Main Database is now synchronized with audited data.');
   console.log('======================================================\n');
 
-  return { success: true, priceSymbols: priceSymbolsMap.size, fundSymbols: fundSymbolsMap.size };
+  return { success: true, priceSymbols: priceSymbolsMap.size, fundSymbols: fundSymbolsMap.size, companyRows: companyRows.length };
 }

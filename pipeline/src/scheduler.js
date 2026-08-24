@@ -5,11 +5,15 @@ import { fileURLToPath } from 'url';
 import { scrapeLiveMarketSnapshot } from './scrapers/live_scraper.js';
 import { DataAuditor } from '../../shared/data_auditor.js';
 import { publishLiveSnapshot } from './sync/publisher.js';
-import { isScraperEnabled, scraperBlockedMessage } from '../../shared/scraper_registry.js';
+import { isScraperEnabled, scraperBlockedMessage, assertNoConflictingScrapers } from '../../shared/scraper_registry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+// Refuses to boot if this process and the server would both be writing the
+// same 15:30 BST closing snapshot -- see assertNoConflictingScrapers().
+assertNoConflictingScrapers();
 
 const DHAKA_TZ = 'Asia/Dhaka';
 

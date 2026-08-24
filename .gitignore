@@ -33,6 +33,13 @@ yarn-error.log*
 # Raw source dataset dumps (Kaggle/Mendeley/etc.) and local staging working data
 pipeline/data/
 
+# Generated runtime data snapshots (not source) -- latest.json is a live
+# zero-fail fallback rewritten on every scrape, history.json/missing_report.json
+# are dead artifacts of an older flat-file design. Keep data/.gitkeep so the
+# directory still exists on a fresh clone.
+data/*.json
+
 # Claude Code local tool state
 .claude/
 
+.playwright-mcp/

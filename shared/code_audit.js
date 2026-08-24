@@ -3,7 +3,7 @@
  * (pipeline/src/), and the shared foundation (shared/) both depend on. Complements
  * the data-level auditors (shared/data_auditor.js for staging/main-DB records,
  * server/audit/db_auditor.js for the main DB as a whole) by catching bad patterns
- * in the CODE before they ever produce bad data -- see docs/AUDIT_RULES.md for the
+ * in the CODE before they ever produce bad data -- see ARCHITECTURE.md for the
  * full rationale, including the canonical null/number rule this enforces:
  *   1. Never `||` for a numeric fallback -- always `??` (or a shared/safe_number.js
  *      helper). `||` treats a real 0 the same as missing data.
@@ -31,7 +31,13 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.join(__dirname, '..');
 
-const SCAN_DIRS = ['server', 'pipeline/src', 'shared'];
+// scripts/ added 2026-08-23: the CSV-fabrication bug in
+// scripts/export_job1_csv.js (open ?? ycp, high/low ?? close -- exactly the
+// "borrow another field's value" pattern the ERROR_PATTERNS below exist to
+// catch) sat undetected for as long as it did specifically because this
+// directory was never scanned, despite scripts/ writing files the API serves
+// directly (/api/download/job1-price-history).
+const SCAN_DIRS = ['server', 'pipeline/src', 'shared', 'scripts'];
 
 // This tool's own source (and its sibling data-auditors/canonical helpers)
 // legitimately contains the pattern strings being searched for -- exclude audit
@@ -65,7 +71,7 @@ const ERROR_PATTERNS = [
 const WARNING_PATTERNS = [
   { name: '`|| 0` fallback', regex: /\|\|\s*0\b(?!\.\d)/g },
   { name: '`?? 0` fallback', regex: /\?\?\s*0\b(?!\.\d)/g },
-  // The exact shape of the fundamentals_history incident (see AUDIT_RULES.md):
+  // The exact shape of the fundamentals_history incident (see ARCHITECTURE.md):
   // `x !== undefined ? ... : fallback` looks like a null-check but isn't one --
   // `null !== undefined` is true in JS, so a real null sails through the `?` branch
   // and `Number(null)` silently becomes 0. A line with `!== undefined` that does

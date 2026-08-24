@@ -26,8 +26,16 @@ async function deploy() {
   console.log(`${colors.bright}${colors.green}  🚀 DSE Live Build & 1-Command Cloud Deployer${colors.reset}`);
   console.log(`${colors.bright}${colors.blue}====================================================${colors.reset}`);
 
-  // Step 1: Validate Frontend Build
-  run('npm run build', 'Validating & compiling frontend production bundle');
+  // Step 1: Test + audit gate. This repo (dse-pulse-backend) has no "build"
+  // script -- the previous `npm run build` call here always failed at this
+  // exact step (npm error: Missing script "build"), so this deployer never
+  // actually got past step 1. Replaced 2026-08-23 with this project's real
+  // pre-change gate (see CLAUDE.md: "Before changing anything in server/db.js,
+  // server/index.js, ... run npm test && npm run audit:all ... confirm it
+  // passes"). A deploy is exactly the moment that gate matters most -- this
+  // is the one command capable of pushing straight to production.
+  run('npm test', 'Running shared test suite');
+  run('npm run audit:all', 'Running full fabrication/data audit (code + staging + main DB)');
 
   // Step 2: Check Git Status
   let status;
@@ -47,7 +55,9 @@ async function deploy() {
   const commitMsg = userMsg ? `Update: ${userMsg}` : `Deploy update (${nowDhaka} BST)`;
 
   if (status) {
-    console.log(`\n${colors.yellow}Found modified/new files. Staging and committing...${colors.reset}`);
+    console.log(`\n${colors.yellow}Found modified/new files:${colors.reset}`);
+    console.log(status.split('\n').map(l => `  ${l}`).join('\n'));
+    console.log(`\n${colors.yellow}Staging and committing...${colors.reset}`);
     run('git add .', 'Staging all changes');
     run(`git commit -m "${commitMsg}"`, `Committing with message: "${commitMsg}"`);
   } else {

@@ -9,7 +9,16 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '..', '.env') });
 
 const API_BASE = process.env.BACKEND_API_URL || 'http://localhost:5001';
-const INGEST_KEY = process.env.INGEST_API_KEY || 'dse-pulse-internal-key-2026';
+// No fallback: this key must match the backend's INGEST_API_KEY exactly, and a
+// hardcoded default here was the other half of the hardcoded-key exposure (the
+// backend's matching fallback has been removed too). Fail loudly instead of
+// silently sending a guessable key that will just get 403'd -- or worse, would
+// have worked, since it used to match the server's own default.
+if (!process.env.INGEST_API_KEY) {
+  console.error('[FATAL] INGEST_API_KEY is not set. Refusing to publish to the ingest API with a default/guessable key.');
+  process.exit(1);
+}
+const INGEST_KEY = process.env.INGEST_API_KEY;
 
 // keepAlive: false -- manual_promoter.js loads and groups the ENTIRE staging
 // price-history table (900K+ rows across 395 symbols) into memory between the
@@ -45,18 +54,47 @@ export async function publishLiveSnapshot(snapshot) {
 }
 
 /**
- * Pushes company fundamentals and 20-year statements to backend
+ * Pushes 20-year audited statements to backend -- fundamentals_history is the
+ * only fundamentals table main DB has now (company_fundamentals dropped
+ * 2026-08-23, "current" is derived server-side from the latest fiscal_year
+ * row, so there's no separate current-snapshot object to send here anymore).
  */
-export async function publishCompanyFundamentals(symbol, fundamentals, statements = []) {
+export async function publishCompanyFundamentals(symbol, statements = []) {
   try {
     const res = await client.post('/api/ingest/fundamentals', {
       symbol,
-      fundamentals,
       statements
     });
     return res.data;
   } catch (err) {
     console.error(`[SYNC PUBLISHER] Failed publishing fundamentals for ${symbol}: ${err.response?.data?.error || err.message}`);
+    throw err;
+  }
+}
+
+/**
+ * Pushes the full company/instrument roster to backend's company_list.
+ */
+export async function publishCompanyList(records = []) {
+  try {
+    const res = await client.post('/api/ingest/companylist', { records });
+    return res.data;
+  } catch (err) {
+    console.error(`[SYNC PUBLISHER] Failed publishing company list: ${err.response?.data?.error || err.message}`);
+    throw err;
+  }
+}
+
+/**
+ * Pushes current shareholding snapshots (current + prior-disclosed-month
+ * only, see stg_shareholding_current's own comment) to backend.
+ */
+export async function publishShareholding(records = []) {
+  try {
+    const res = await client.post('/api/ingest/shareholding', { records });
+    return res.data;
+  } catch (err) {
+    console.error(`[SYNC PUBLISHER] Failed publishing shareholding: ${err.response?.data?.error || err.message}`);
     throw err;
   }
 }

@@ -10,11 +10,20 @@ async function verify50Samples() {
   console.log('========================================================================\n');
 
   // 1. Fetch 50 diverse sample stocks from fundamentals across various sectors
+  // company_fundamentals dropped 2026-08-23 (see ARCHITECTURE.md) -- "current"
+  // is each symbol's latest fiscal_year row in fundamentals_history, joined
+  // against company_list for name/sector/category.
   const sampleStocks = await dbAll(`
-    SELECT f.symbol, f.name, f.sector, f.category, f.eps_basic, f.nav_per_share, f.dividend_yield
-    FROM company_fundamentals f
-    GROUP BY f.sector, f.symbol
-    ORDER BY f.sector ASC, f.symbol ASC
+    WITH latest AS (
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY fiscal_year DESC) as rn
+      FROM fundamentals_history
+    )
+    SELECT l.symbol, c.name, c.sector, c.category, l.eps_basic, l.nav_per_share, l.dividend_yield
+    FROM latest l
+    LEFT JOIN company_list c ON c.symbol = l.symbol
+    WHERE l.rn = 1
+    GROUP BY c.sector, l.symbol
+    ORDER BY c.sector ASC, l.symbol ASC
     LIMIT 50
   `);
 
@@ -107,7 +116,8 @@ async function verify50Samples() {
   console.table(sampleReport.slice(25, 50));
 
   console.log('\n========================================================================');
-  console.log(`  🎯 VERIFICATION RESULT: ${satisfactoryCount} / ${sampleStocks.length} (100%) Stocks Satisfactory!`);
+  const satisfactoryPct = sampleStocks.length > 0 ? ((satisfactoryCount / sampleStocks.length) * 100).toFixed(1) : '0.0';
+  console.log(`  🎯 VERIFICATION RESULT: ${satisfactoryCount} / ${sampleStocks.length} (${satisfactoryPct}%) Stocks Satisfactory!`);
   console.log(`  📊 Total 20-Year Historical Sessions Across Sample: ${totalRecordsChecked.toLocaleString()} trading sessions`);
   console.log('========================================================================\n');
 

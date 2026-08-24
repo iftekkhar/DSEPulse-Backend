@@ -1,7 +1,7 @@
 /**
  * Canonical null/number handling for this project. One rule, one implementation,
  * used everywhere instead of a hand-rolled ternary re-derived (and re-gotten-wrong)
- * at each call site -- see docs/AUDIT_RULES.md for the incidents this caused.
+ * at each call site -- see ARCHITECTURE.md for the incidents this caused.
  *
  * THE RULE:
  *   1. Never use `||` for a numeric fallback -- it treats a real `0` the same as
@@ -26,7 +26,7 @@
  * every other file should call this instead of `x !== null && x !== undefined ?
  * Number(x) : null` (easy to typo into `x !== undefined` alone, which misses null
  * and lets `Number(null)` -- silently 0 -- through; see the fundamentals_history
- * incident in AUDIT_RULES.md).
+ * incident in ARCHITECTURE.md).
  */
 export function numOrNull(value) {
   if (value === null || value === undefined) return null;

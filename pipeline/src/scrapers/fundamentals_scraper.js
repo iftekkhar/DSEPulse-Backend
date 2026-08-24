@@ -46,7 +46,7 @@
  */
 
 import * as cheerio from 'cheerio';
-import { initStagingDB, stageFundamental, dbGet, dbAll } from '../db/staging_db.js';
+import { initStagingDB, stageFundamental, stageShareholding, dbGet, dbAll } from '../db/staging_db.js';
 import { loadActiveSymbols } from './company_list_scraper.js';
 import { fetchWithRetry, runBatched } from '../../../shared/dse_http_client.js';
 import { isScraperEnabled, scraperBlockedMessage } from '../../../shared/scraper_registry.js';
@@ -74,7 +74,12 @@ export function headlineOrContinuing(cells) {
   return lastNumberInGroup(cells, 0) ?? lastNumberInGroup(cells, 3);
 }
 
-async function scrapeCompanyFundamentals(symbol) {
+// Exported so the live cross-check audit (external_crosscheck_dse_fundamentals.js)
+// can reuse this exact parsing logic as its "ground truth" fetch, rather than
+// re-implementing DSE's table layout a second time in a second file -- two
+// independent parsers of the same page are two independent places to drift out
+// of sync with each other, which defeats the point of a cross-check.
+export async function scrapeCompanyFundamentals(symbol) {
   const url = `https://www.dsebd.org/displayCompany.php?name=${encodeURIComponent(symbol)}`;
   let html;
 
@@ -126,7 +131,16 @@ async function scrapeCompanyFundamentals(symbol) {
       // is a real, legitimate value (the company paid no dividend that year), not
       // a sign the cell was unparseable.
       const dividend_yield = data.length > 7 ? numOrNull(data[7]) : null;
-      const dividend_pct = dividendCellRaw !== null ? numOrNull(dividendCellRaw) : null;
+      // The cash-dividend cell is sometimes a compound string when a bonus was
+      // also issued that year, e.g. "5.00, 5% B" (5% cash + 5% bonus) -- the cash
+      // % is the leading number before the comma. numOrNull on the raw compound
+      // string chokes on the trailing ", 5% B" and silently returns null, which
+      // previously made every bonus-year's cash DPS disappear (caught by the live
+      // DSE cross-check audit: 288/288 dps mismatches were exactly this pattern,
+      // 0 in years with no bonus). Extracting the pre-comma segment first fixes
+      // both the plain case ("10.00") and the compound case.
+      const cashDividendPart = dividendCellRaw !== null ? dividendCellRaw.split(',')[0].trim() : null;
+      const dividend_pct = cashDividendPart ? numOrNull(cashDividendPart.replace('%', '')) : null;
       const row = getRow(fiscal_year);
       row.pe_ratio = pe_ratio;
       row.dividend_yield = dividend_yield;
@@ -210,6 +224,53 @@ async function scrapeCompanyFundamentals(symbol) {
     }
   }
 
+  // Shareholding pattern -- same page, "Other Information of the Company"
+  // table has one row per disclosed month: label "Share Holding Percentage
+  // [as on <Month Day, Year>]" followed by a nested 5-cell table
+  // (Sponsor/Director, Govt, Institute, Foreign, Public). Identical parsing
+  // to server/scrapers/audited_eps_scraper.js's live-side version -- kept as
+  // a second, independent read of the same page rather than a shared helper,
+  // since pipeline/ (dev-only, cheerio via this file's own import) and
+  // server/ (production, no cross-subsystem imports by design -- see
+  // ARCHITECTURE.md's two-subsystem split) don't import from each other.
+  // Attached as a property on the returned array (not a `{disclosures,
+  // shareholding}` object) so this stays backward-compatible with every
+  // existing caller that treats scrapeCompanyFundamentals's return value as
+  // a plain array of yearly disclosures.
+  {
+    const disclosures = [];
+    $('td').each((_, td) => {
+      const label = $(td).text().replace(/\s+/g, ' ').trim();
+      const m = label.match(/Share Holding Percentage\s*\[as on ([^\]]+?)(?:\s*\(year ended\))?\]/i);
+      if (!m) return;
+      const asOfDate = new Date(m[1]);
+      if (isNaN(asOfDate.getTime())) return;
+      const nestedRow = $(td).next('td').find('tr').first();
+      const cells = {};
+      nestedRow.find('td').each((_, cell) => {
+        const cellText = $(cell).text().replace(/\s+/g, ' ').trim();
+        const cm = cellText.match(/^(Sponsor\/Director|Govt|Institute|Foreign|Public):\s*(-?\d+\.?\d*)$/i);
+        if (cm) cells[cm[1]] = parseFloat(cm[2]);
+      });
+      if (Object.keys(cells).length === 5) {
+        disclosures.push({
+          asOfDate: asOfDate.toISOString().slice(0, 10),
+          sponsorPct: cells['Sponsor/Director'],
+          govtPct: cells['Govt'],
+          institutePct: cells['Institute'],
+          foreignPct: cells['Foreign'],
+          publicPct: cells['Public'],
+        });
+      }
+    });
+    disclosures.sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+    const latest = disclosures[disclosures.length - 1];
+    const prior = disclosures[disclosures.length - 2];
+    if (latest) {
+      results.shareholding = { current: latest, previous: prior || null };
+    }
+  }
+
   return results;
 }
 
@@ -246,11 +307,28 @@ export async function scrapeFundamentalsForAll({ symbols = null, verbose = true,
   let symbolsWithNoData = 0;
   let totalBlockedYears = 0;
   let processed = 0;
+  let shareholdingStaged = 0;
+  let shareholdingBlocked = 0;
 
   await runBatched(targetSymbols, async (symbol) => {
     try {
       const disclosures = await scrapeCompanyFundamentals(symbol);
       processed++;
+
+      // Shareholding is an independent fact from the fundamentals below --
+      // audited and staged on its own, so a fundamentals audit failure never
+      // blocks a valid shareholding snapshot or vice versa (same reasoning
+      // as server/scrapers/audited_eps_scraper.js's identical split).
+      if (disclosures.shareholding?.current) {
+        const shAudit = DataAuditor.auditShareholdingRecord(symbol, disclosures.shareholding.current);
+        if (shAudit.passed) {
+          await stageShareholding({ symbol, ...disclosures.shareholding });
+          shareholdingStaged++;
+        } else {
+          shareholdingBlocked++;
+          console.warn(`  [Fundamentals] ${symbol}: shareholding BLOCKED by audit -`, shAudit.errors);
+        }
+      }
 
       if (disclosures.length > 0) {
         // Audit gate before stageFundamental. auditFinancialStatements' `cleaned`
@@ -297,7 +375,9 @@ export async function scrapeFundamentalsForAll({ symbols = null, verbose = true,
   console.log(`   Symbols with no data:      ${symbolsWithNoData} (bonds/MFs/new listings)`);
   console.log(`   Total disclosures staged:  ${totalDisclosures}`);
   console.log(`   Years blocked by audit:    ${totalBlockedYears}`);
+  console.log(`   Shareholding staged:       ${shareholdingStaged}`);
+  console.log(`   Shareholding blocked:      ${shareholdingBlocked}`);
   console.log(`   Source: DSE_OFFICIAL (all data is from official company disclosures)`);
 
-  return { totalDisclosures, symbolsWithData, symbolsWithNoData, totalBlockedYears };
+  return { totalDisclosures, symbolsWithData, symbolsWithNoData, totalBlockedYears, shareholdingStaged, shareholdingBlocked };
 }

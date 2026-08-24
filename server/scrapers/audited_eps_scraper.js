@@ -1,11 +1,9 @@
-import axios from 'axios';
-import https from 'https';
 import * as cheerio from 'cheerio';
-import { dbAll, saveFundamentalsBulkDelta } from '../db.js';
+import { dbAll, saveFundamentalsBulkDelta, saveShareholdingCurrent } from '../db.js';
 import { DataAuditor } from '../../shared/data_auditor.js';
 import { isScraperEnabled, scraperBlockedMessage } from '../../shared/scraper_registry.js';
-
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+import { fetchWithRetry } from '../../shared/dse_http_client.js';
+import { headlineOrContinuing, lastNumberInGroup } from '../../shared/fundamentals_parsing.js';
 
 /**
  * Dedicated Audited EPS & Financial Statements Parser for DSE
@@ -18,13 +16,18 @@ export async function scrapeCompanyAuditedFinancials(symbol) {
   const url = `https://www.dsebd.org/displayCompany.php?name=${encodeURIComponent(cleanSym)}`;
   
   try {
-    const res = await axios.get(url, {
+    // This function is the sole fetch path for both the daily Job 3 delta
+    // (server/index.js, ~640 symbols every production day) and the weekly
+    // full scraper below -- retried with backoff so one transient failure
+    // doesn't just permanently count that symbol as "unchanged" for the day.
+    const res = await fetchWithRetry(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
-      httpsAgent,
-      timeout: 20000
+      timeout: 20000,
+      attempts: 3,
+      backoffMs: 2000
     });
 
     if (!res.data || res.status !== 200) return null;
@@ -48,8 +51,51 @@ export async function scrapeCompanyAuditedFinancials(symbol) {
       debtToEquity: null,
       currentRatio: null,
       auditedPeriod: null,
-      quarterlyDisclosure: null
+      quarterlyDisclosure: null,
+      shareholding: null
     };
+
+    // Shareholding pattern -- same page, "Other Information of the Company"
+    // table has one row per disclosed month: label "Share Holding Percentage
+    // [as on <Month Day, Year>]" followed by a nested 5-cell table
+    // (Sponsor/Director, Govt, Institute, Foreign, Public, each summing to
+    // ~100%). DSE publishes the year-end figure plus the last ~2 monthly
+    // snapshots on every page load -- confirmed live 2026-08-24. Per the
+    // agreed scope, only current + the immediately-prior disclosed month are
+    // kept (not a growing history): take the two highest-dated rows found.
+    {
+      const disclosures = [];
+      $('td').each((_, td) => {
+        const label = $(td).text().replace(/\s+/g, ' ').trim();
+        const m = label.match(/Share Holding Percentage\s*\[as on ([^\]]+?)(?:\s*\(year ended\))?\]/i);
+        if (!m) return;
+        const asOfDate = new Date(m[1]);
+        if (isNaN(asOfDate.getTime())) return;
+        const nestedRow = $(td).next('td').find('tr').first();
+        const cells = {};
+        nestedRow.find('td').each((_, cell) => {
+          const cellText = $(cell).text().replace(/\s+/g, ' ').trim();
+          const cm = cellText.match(/^(Sponsor\/Director|Govt|Institute|Foreign|Public):\s*(-?\d+\.?\d*)$/i);
+          if (cm) cells[cm[1]] = parseFloat(cm[2]);
+        });
+        if (Object.keys(cells).length === 5) {
+          disclosures.push({
+            asOfDate: asOfDate.toISOString().slice(0, 10),
+            sponsorPct: cells['Sponsor/Director'],
+            govtPct: cells['Govt'],
+            institutePct: cells['Institute'],
+            foreignPct: cells['Foreign'],
+            publicPct: cells['Public'],
+          });
+        }
+      });
+      disclosures.sort((a, b) => a.asOfDate.localeCompare(b.asOfDate));
+      const latest = disclosures[disclosures.length - 1];
+      const prior = disclosures[disclosures.length - 2];
+      if (latest) {
+        data.shareholding = { current: latest, previous: prior || null };
+      }
+    }
 
     // 1. Extract Sector, Category, Authorized & Paid-Up Capital
     $('table tr').each((_, tr) => {
@@ -96,16 +142,25 @@ export async function scrapeCompanyAuditedFinancials(symbol) {
 
           if (cols.length >= 4 && cols[0].match(/^(19|20)\d{2}$/)) {
             const yr = parseInt(cols[0], 10);
-            const nums = cols.slice(1).map(c => {
-              const cleaned = c.replace(/,/g, '');
-              const val = parseFloat(cleaned);
-              return isNaN(val) ? null : val;
-            }).filter(n => n !== null);
+            // DSE's per-year table lays this out in fixed 3-cell groups:
+            // [0-2]=headline EPS, [3-5]=EPS-Continuing-Operations, [6-8]=NAV
+            // Per Share (see shared/fundamentals_parsing.js). The previous
+            // `nums[0]`/`nums[1]` here just took the first two non-dash
+            // numbers across the whole flattened row -- which happened to
+            // often land on the right cells (the overwhelming majority of
+            // companies leave the headline EPS group entirely dashed), but
+            // silently picked the wrong value whenever a company DID report
+            // discontinued operations (headline group populated) or restated
+            // a prior EPS figure (Restated must supersede Original within the
+            // same group, not just "whichever numeric cell came first").
+            const dataCells = cols.slice(1);
+            const eps = headlineOrContinuing(dataCells);
+            const navps = lastNumberInGroup(dataCells, 6);
 
-            if (yr >= latestYear && nums.length >= 2) {
+            if (yr >= latestYear && eps !== null) {
               latestYear = yr;
-              latestEps = nums[0];
-              latestNav = nums[1];
+              latestEps = eps;
+              latestNav = navps;
             }
           }
         });
@@ -177,7 +232,9 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
   console.log('  🔍 Starting Weekly Audited EPS & Fundamentals Crawler');
   console.log('======================================================');
 
-  const rows = await dbAll(`SELECT symbol FROM company_fundamentals ORDER BY symbol ASC`);
+  // company_fundamentals dropped 2026-08-23 (see ARCHITECTURE.md) -- target
+  // pool is now every symbol with at least one fundamentals_history row.
+  const rows = await dbAll(`SELECT DISTINCT symbol FROM fundamentals_history ORDER BY symbol ASC`);
   const symbols = rows.map(r => r.symbol);
 
   console.log(`[AUDITED SCRAPER] Target pool: ${symbols.length} listed equities in SQLite DB`);
@@ -188,10 +245,13 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
   let totalBlocked = 0;
   const allUpdatedSymbols = [];
 
+  let totalShareholdingSaved = 0;
+
   // Batch execution with concurrency control and bulk delta saving
   for (let i = 0; i < symbols.length; i += concurrency) {
     const batch = symbols.slice(i, i + concurrency);
     const scrapedRecords = [];
+    const shareholdingRecords = [];
 
     await Promise.all(batch.map(async (sym) => {
       try {
@@ -199,6 +259,17 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
         if (!scraped || scraped.epsBasic === null) {
           totalUnchanged++;
           return;
+        }
+        // Shareholding is an independent fact from the fundamentals below --
+        // audited and saved on its own, so a fundamentals audit failure
+        // never blocks a valid shareholding snapshot or vice versa.
+        if (scraped.shareholding?.current) {
+          const shAudit = DataAuditor.auditShareholdingRecord(sym, scraped.shareholding.current);
+          if (shAudit.passed) {
+            shareholdingRecords.push({ symbol: sym, shareholding: scraped.shareholding });
+          } else {
+            console.warn(`[AUDITED SCRAPER] Shareholding BLOCKED ${sym}:`, shAudit.errors);
+          }
         }
         // Audit gate before this reaches saveFundamentalsBulkDelta -- same
         // 1-element-statements-array pattern used in server/index.js's Job 3
@@ -239,6 +310,11 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
       }
     }
 
+    if (shareholdingRecords.length > 0) {
+      const shResult = await saveShareholdingCurrent(shareholdingRecords);
+      totalShareholdingSaved += shResult.saved;
+    }
+
     // Polite delay between batches to respect DSE servers
     await new Promise(r => setTimeout(r, 250));
   }
@@ -246,7 +322,7 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
   const durationSeconds = Number(((Date.now() - startTime) / 1000).toFixed(2));
   console.log('======================================================');
   console.log(`[AUDITED SCRAPER] Completed in ${durationSeconds}s`);
-  console.log(`[AUDITED SCRAPER] Checked: ${symbols.length} | Updated: ${totalUpdated} | Unchanged: ${totalUnchanged} | Blocked: ${totalBlocked} | Errors: ${totalFailed}`);
+  console.log(`[AUDITED SCRAPER] Checked: ${symbols.length} | Updated: ${totalUpdated} | Unchanged: ${totalUnchanged} | Blocked: ${totalBlocked} | Errors: ${totalFailed} | Shareholding saved: ${totalShareholdingSaved}`);
   console.log('======================================================\n');
 
   return {
@@ -256,6 +332,7 @@ export async function runAuditedEPSWeeklyScraper(concurrency = 6) {
     unchanged: totalUnchanged,
     blocked: totalBlocked,
     failed: totalFailed,
+    shareholdingSaved: totalShareholdingSaved,
     durationSeconds,
     updatedSymbols: allUpdatedSymbols
   };

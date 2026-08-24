@@ -80,6 +80,7 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
 
   const allComparisons = [];
   const mismatches = [];
+  const incomparableRows = []; // {symbol, date, db_close, lanka_close} -- which side was null, for diagnosis
   let totalCompared = 0;
   let missingInDb = 0;
   let missingInLanka = 0;
@@ -113,6 +114,14 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
       // can't meaningfully compare against an unknown value, so skip instead.
       if (dbRow.close === null || dbRow.close === undefined || lankaRow.close === null || lankaRow.close === undefined) {
         incomparable++;
+        // Previously uncounted beyond a single aggregate number -- kept here
+        // (2026-08-23) so a rare incomparable row can actually be identified
+        // and inspected instead of just being a number in the summary.
+        incomparableRows.push({
+          symbol, date,
+          db_close: dbRow.close ?? null,
+          lanka_close: lankaRow.close ?? null,
+        });
         continue;
       }
       totalCompared++;
@@ -155,6 +164,10 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
   console.log('   EXTERNAL CROSS-CHECK SUMMARY (vs lankabd.com)');
   console.log('======================================================');
   console.log(JSON.stringify(summary, null, 2));
+  if (incomparableRows.length > 0) {
+    console.log(`\nIncomparable rows (matched date, null close on one side):`);
+    console.log(JSON.stringify(incomparableRows, null, 2));
+  }
 
   // Persist full mismatch list to CSV
   const csvPath = path.join(__dirname, '..', '..', 'data', 'external_crosscheck_mismatches.csv');
@@ -164,6 +177,18 @@ export async function runExternalCrossCheck({ symbols, fromDate = '2013-01-01', 
   }
   fs.writeFileSync(csvPath, csvLines.join('\n'));
   console.log(`\nFull mismatch list written to: ${csvPath}`);
+
+  // Separate small CSV for incomparable rows (2026-08-23) -- previously only
+  // an aggregate count with no way to identify which row(s) it referred to.
+  const incomparableCsvPath = path.join(__dirname, '..', '..', 'data', 'external_crosscheck_incomparable.csv');
+  const incomparableLines = ['symbol,date,db_close,lanka_close'];
+  for (const r of incomparableRows) {
+    incomparableLines.push(`${r.symbol},${r.date},${r.db_close ?? ''},${r.lanka_close ?? ''}`);
+  }
+  fs.writeFileSync(incomparableCsvPath, incomparableLines.join('\n'));
+  if (incomparableRows.length > 0) {
+    console.log(`Incomparable-row list written to: ${incomparableCsvPath}`);
+  }
 
   // Log into audit_reports as a distinct, clearly-labeled external audit entry
   await dbRun(`

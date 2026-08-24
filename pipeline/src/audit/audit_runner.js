@@ -67,6 +67,31 @@ export async function runFullStagingAudit() {
     console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${fundRows.length} annual disclosures across ${fundSymbolsMap.size} companies. 0 blocking errors.`);
   }
 
+  // 2b. Audit Shareholding Pattern in Staging DB (2026-08-24) -- current
+  // snapshot only, one row per symbol, same reasoning as stg_annual_fundamentals
+  // above but auditShareholdingRecord checks a single current snapshot, not
+  // a per-symbol array of years.
+  console.log('\n2b. Auditing `stg_shareholding_current`...');
+  const shRows = await dbAll('SELECT * FROM stg_shareholding_current');
+  totalAuditedRecords += shRows.length;
+
+  let shAuditPassed = true;
+  for (const r of shRows) {
+    const auditRes = DataAuditor.auditShareholdingRecord(r.symbol, {
+      sponsorPct: r.sponsor_pct, govtPct: r.govt_pct, institutePct: r.institute_pct,
+      foreignPct: r.foreign_pct, publicPct: r.public_pct,
+    });
+    if (!auditRes.passed) {
+      shAuditPassed = false;
+      totalErrors += auditRes.errors.length;
+      console.error(`  \x1b[31m✖ ERROR\x1b[0m [${r.symbol}] Shareholding Audit Failed:`, auditRes.errors);
+    }
+    totalWarnings += auditRes.warnings.length;
+  }
+  if (shAuditPassed) {
+    console.log(`  \x1b[32m✔ PASS\x1b[0m Audited ${shRows.length} shareholding snapshots. 0 blocking errors.`);
+  }
+
   // 3. Audit Index History Benchmark in Staging DB
   console.log('\n3. Auditing `stg_index_history`...');
   const dsexRows = await dbAll('SELECT * FROM stg_index_history ORDER BY trade_date ASC');
@@ -88,7 +113,7 @@ export async function runFullStagingAudit() {
     console.log('  \x1b[33m⚠ NOTICE\x1b[0m No DSEX records currently in staging DB.');
   }
 
-  const overallPassed = priceAuditPassed && fundAuditPassed && dsexAuditPassed && totalErrors === 0;
+  const overallPassed = priceAuditPassed && fundAuditPassed && shAuditPassed && dsexAuditPassed && totalErrors === 0;
   const status = overallPassed ? 'CERTIFIED_PASSED' : 'AUDIT_FAILED';
 
   // Save audit report to staging database
@@ -102,7 +127,7 @@ export async function runFullStagingAudit() {
     totalErrors,
     totalWarnings,
     status,
-    JSON.stringify({ priceAuditPassed, fundAuditPassed, dsexAuditPassed, totalErrors, totalWarnings })
+    JSON.stringify({ priceAuditPassed, fundAuditPassed, shAuditPassed, dsexAuditPassed, totalErrors, totalWarnings })
   ]);
 
   console.log('\n======================================================');

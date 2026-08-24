@@ -2,6 +2,7 @@ import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs-extra';
 import { fileURLToPath } from 'url';
+import { tierAllowsOverwrite } from '../../../shared/source_tiers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -115,7 +116,7 @@ export async function initStagingDB() {
       ycp               REAL,            -- Yesterday's closing price (if available)
       change_amt        REAL,
       change_pct        REAL,
-      source            TEXT NOT NULL,   -- 'MENDELEY', 'DSE_SCRAPE', 'DERIVED'
+      source            TEXT NOT NULL,   -- Tier 1 'DSE_SCRAPE', Tier 2 'LANKABD' -- see shared/source_tiers.js
       staged_at         TEXT NOT NULL,
       PRIMARY KEY (symbol, trade_date)
     )
@@ -138,7 +139,7 @@ export async function initStagingDB() {
       advancing         INTEGER,
       declining         INTEGER,
       unchanged         INTEGER,
-      source            TEXT NOT NULL,     -- 'MENDELEY', 'KAGGLE', 'DSE_SCRAPE'
+      source            TEXT NOT NULL,     -- Tier 1 'DSE_OFFICIAL_ARCHIVE'/'DSE_OFFICIAL_BENCHMARK', approved Tier 3 'KAGGLE'/'MCAP_WEIGHTED_ESTIMATE' -- see shared/source_tiers.js
       staged_at         TEXT NOT NULL
     )
   `);
@@ -177,6 +178,32 @@ export async function initStagingDB() {
   // computes on the fly), so a persisted table just risked silent staleness for
   // no benefit. stg_computed_analytics / stg_performance_summary were dropped.
 
+  // ── Table 5b: Shareholding Pattern (current snapshot only, 2026-08-24) ────
+  // Same shape and same "current-only, no growing history" product decision
+  // as main DB's shareholding_current (see server/db.js's initDB for the full
+  // reasoning): DSE's own company page already shows the latest disclosed
+  // month next to the one before it on every fetch, so this table is
+  // overwritten wholesale per symbol, never appended to.
+  await dbRun(`
+    CREATE TABLE IF NOT EXISTS stg_shareholding_current (
+      symbol              TEXT PRIMARY KEY,
+      sponsor_pct         REAL,
+      govt_pct            REAL,
+      institute_pct       REAL,
+      foreign_pct         REAL,
+      public_pct          REAL,
+      as_of_date          TEXT,
+      prev_sponsor_pct    REAL,
+      prev_govt_pct       REAL,
+      prev_institute_pct  REAL,
+      prev_foreign_pct    REAL,
+      prev_public_pct     REAL,
+      prev_as_of_date     TEXT,
+      source              TEXT NOT NULL,
+      staged_at           TEXT NOT NULL
+    )
+  `);
+
   // ── Table 6: Audit Certification Logs ────────────────────────────────────
   await dbRun(`
     CREATE TABLE IF NOT EXISTS audit_reports (
@@ -208,11 +235,33 @@ export async function stagePriceBatch(records = []) {
   const now = new Date().toISOString();
   const BATCH_SIZE = 500;
   let count = 0;
+  let blockedByTier = 0;
+
+  // Tier-priority guard (ARCHITECTURE.md item 5, 2026-08-22): gap_scraper.js
+  // (DSE, Tier 1) and lankabd_scraper.js (LankaBD, Tier 2) both call this for
+  // overlapping date ranges, and the ON CONFLICT below previously overwrote
+  // `source` unconditionally -- whichever ran last won, regardless of tier.
+  // Not hypothetical: the first live lankabd_scraper.js run silently replaced
+  // ~8,160 real DSE_SCRAPE rows before this guard existed. Pre-fetch grouped
+  // by symbol since both callers typically stage one symbol's full date range
+  // per call -- one query per distinct symbol in this batch, not one per row.
+  const symbolSet = new Set(records.map(r => r.symbol && r.symbol.toUpperCase().trim()).filter(Boolean));
+  const existingSourceMap = new Map(); // "SYMBOL|DATE" -> source
+  for (const sym of symbolSet) {
+    const rows = await dbAll(`SELECT trade_date, source FROM stg_price_history WHERE symbol = ?`, [sym]);
+    for (const r of rows) existingSourceMap.set(`${sym}|${r.trade_date}`, r.source);
+  }
 
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const batch = records.slice(i, i + BATCH_SIZE);
     const stmts = batch
       .filter(r => r.symbol && r.trade_date && r.close != null && r.close > 0)
+      .filter(r => {
+        const sym = r.symbol.toUpperCase().trim();
+        const allowed = tierAllowsOverwrite(existingSourceMap.get(`${sym}|${r.trade_date}`), r.source);
+        if (!allowed) blockedByTier++;
+        return allowed;
+      })
       .map(r => ({
         sql: `INSERT INTO stg_price_history
           (symbol, trade_date, open, high, low, close, volume, value_mn, trades, ycp, change_amt, change_pct, source, staged_at)
@@ -244,6 +293,9 @@ export async function stagePriceBatch(records = []) {
     await dbTransaction(stmts);
     count += stmts.length;
   }
+  if (blockedByTier > 0) {
+    console.warn(`[STAGING DB] stagePriceBatch: ${blockedByTier} record(s) skipped -- existing row already has a better/equal-tier source.`);
+  }
   return count;
 }
 
@@ -254,11 +306,27 @@ export async function stageIndexBatch(records = []) {
   const now = new Date().toISOString();
   const BATCH_SIZE = 500;
   let count = 0;
+  let blockedByTier = 0;
+
+  // Same tier-priority guard as stagePriceBatch (ARCHITECTURE.md item 5) --
+  // this ON CONFLICT previously overwrote `source` unconditionally too, the
+  // identical unguarded-overwrite shape that caused the ~8,160-row price
+  // incident, just never exercised by two competing index sources yet. Added
+  // 2026-08-23 while building dse_index_graph_scraper.js, which upgrades Tier
+  // 3 rows to Tier 1 and must never be able to downgrade an existing Tier 1
+  // row if a future caller's pre-filtering isn't as careful.
+  const existingRows = await dbAll('SELECT trade_date, source FROM stg_index_history');
+  const existingSourceMap = new Map(existingRows.map(r => [r.trade_date, r.source]));
 
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const batch = records.slice(i, i + BATCH_SIZE);
     const stmts = batch
       .filter(r => r.trade_date && r.index_value > 0)
+      .filter(r => {
+        const allowed = tierAllowsOverwrite(existingSourceMap.get(r.trade_date), r.source);
+        if (!allowed) blockedByTier++;
+        return allowed;
+      })
       .map(r => ({
         sql: `INSERT INTO stg_index_history
           (trade_date, index_label, index_value, index_open, index_high, index_low, total_volume, total_value_mn, source, staged_at)
@@ -283,6 +351,9 @@ export async function stageIndexBatch(records = []) {
 
     await dbTransaction(stmts);
     count += stmts.length;
+  }
+  if (blockedByTier > 0) {
+    console.warn(`[STAGING DB] stageIndexBatch: ${blockedByTier} record(s) skipped -- existing row already has a better/equal-tier source.`);
   }
   return count;
 }
@@ -326,6 +397,34 @@ export async function stageFundamental(record) {
     record.dividend_yield ?? null,
     record.market_cap_mn ?? null,
     record.disclosure_date ?? null,
+    now,
+  ]);
+}
+
+// Always a full overwrite of that symbol's one row (current + previous),
+// never an append -- see the table's own comment above.
+export async function stageShareholding(record) {
+  const now = new Date().toISOString();
+  const cur = record.current;
+  const prev = record.previous;
+  await dbRun(`
+    INSERT INTO stg_shareholding_current (
+      symbol, sponsor_pct, govt_pct, institute_pct, foreign_pct, public_pct, as_of_date,
+      prev_sponsor_pct, prev_govt_pct, prev_institute_pct, prev_foreign_pct, prev_public_pct, prev_as_of_date,
+      source, staged_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DSE_OFFICIAL', ?)
+    ON CONFLICT(symbol) DO UPDATE SET
+      sponsor_pct=excluded.sponsor_pct, govt_pct=excluded.govt_pct, institute_pct=excluded.institute_pct,
+      foreign_pct=excluded.foreign_pct, public_pct=excluded.public_pct, as_of_date=excluded.as_of_date,
+      prev_sponsor_pct=excluded.prev_sponsor_pct, prev_govt_pct=excluded.prev_govt_pct,
+      prev_institute_pct=excluded.prev_institute_pct, prev_foreign_pct=excluded.prev_foreign_pct,
+      prev_public_pct=excluded.prev_public_pct, prev_as_of_date=excluded.prev_as_of_date,
+      staged_at=excluded.staged_at
+  `, [
+    String(record.symbol).toUpperCase().trim(),
+    cur.sponsorPct, cur.govtPct, cur.institutePct, cur.foreignPct, cur.publicPct, cur.asOfDate,
+    prev?.sponsorPct ?? null, prev?.govtPct ?? null, prev?.institutePct ?? null,
+    prev?.foreignPct ?? null, prev?.publicPct ?? null, prev?.asOfDate ?? null,
     now,
   ]);
 }

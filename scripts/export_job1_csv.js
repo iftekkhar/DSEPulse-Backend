@@ -77,7 +77,17 @@ export async function exportJob1CSV() {
 
     let buffer = '';
     for (const r of rows) {
-      buffer += `${r.symbol},${r.date},${r.open ?? r.ycp},${r.high ?? r.close},${r.low ?? r.close},${r.close},${r.ycp},${r.change},${r.change_percent},${r.volume},${r.value_mn ?? ''},${r.pe ?? ''}\n`;
+      // Every nullable column blanks to '' when genuinely missing, never a
+      // different field's value (fixed 2026-08-23). `open ?? r.ycp` and
+      // `high/low ?? r.close` used to fabricate a day's OHLC range whenever
+      // the real value wasn't recorded -- silently presenting "yesterday's
+      // close" as today's open, or "today's close" as today's high/low, in a
+      // CSV this project serves directly at /api/download/job1-price-history.
+      // 25,484 rows have a null open and 31,154 have null high/low right now,
+      // all of which were getting this treatment. ycp/change/change_percent/
+      // volume were also missing their own `?? ''`, so a null there rendered
+      // as the literal text "null" in the CSV cell instead of a blank one.
+      buffer += `${r.symbol},${r.date},${r.open ?? ''},${r.high ?? ''},${r.low ?? ''},${r.close},${r.ycp ?? ''},${r.change ?? ''},${r.change_percent ?? ''},${r.volume ?? ''},${r.value_mn ?? ''},${r.pe ?? ''}\n`;
     }
 
     const canContinue = stream.write(buffer);
