@@ -1,11 +1,20 @@
 /**
- * Institutional Data Auditor & Sanity Validator -- shared by both the Pipeline
- * Staging DB gate (pipeline/src/audit/audit_runner.js) and every direct-to-main-DB
- * write path in server/index.js (Job 1/3/4, live sync). One validator, one set of
- * thresholds, used before every DB write in this project -- not a pipeline-only
- * concept that server/ writes bypass.
+ * Institutional Data Auditor & Sanity Validator -- the one gate every scraper
+ * and every direct-to-main-DB write path runs its output through before a
+ * write. One validator, one set of thresholds, used before every DB write in
+ * this project, no exceptions.
  */
 import { numOrNull, positiveNumOrNull, deriveOrNull, roundOrNull } from './safe_number.js';
+
+// Shared sanity-range constants -- single source of truth so server/auditors/
+// audit_main_database.js's post-write DB audit checks the exact same bands
+// this pre-write gate does, instead of each file hand-copying its own value
+// (found independently out of sync: audit_main_database.js was using a
+// 300-15000 DS30 band and a +/-2.0 shareholding tolerance while this file
+// used 500-8000 and +/-1.0 for the same two checks).
+export const DS30_INDEX_MIN = 500;
+export const DS30_INDEX_MAX = 8000; // DS30 has traded roughly 900-3600 since its 2013 launch (verified against the real dsebd.org monthly_graph_index.php?type=ds30 series 2026-08-25); generous headroom on both sides without being as loose as DSEX's own 500-20000 band.
+export const SHAREHOLDING_SUM_TOLERANCE_PCT = 1.0; // DSE rounds each category to 2dp, so a few hundredths of drift is normal rounding, not a parsing bug.
 
 export class DataAuditor {
   /**
@@ -150,6 +159,54 @@ export class DataAuditor {
         warnings.push(`FY${yr} NAVPS is negative or zero (৳${navps})`);
       }
 
+      const dps = numOrNull(stmt.dps);
+      const bonusPct = numOrNull(stmt.bonus_pct);
+      const shortLoan = numOrNull(stmt.short_term_loan_mn);
+      const longLoan = numOrNull(stmt.long_term_loan_mn);
+      const revenueMn = numOrNull(stmt.revenue_mn ?? stmt.revenueMn);
+      const grossProfitMn = numOrNull(stmt.gross_profit_mn ?? stmt.grossProfitMn);
+      const operatingProfitMn = numOrNull(stmt.operating_profit_mn ?? stmt.operatingProfitMn);
+      const totalAssetsMn = numOrNull(stmt.total_assets_mn ?? stmt.totalAssetsMn);
+      const totalLiabilitiesMn = numOrNull(stmt.total_liabilities_mn ?? stmt.totalLiabilitiesMn);
+      const currentAssetsMn = numOrNull(stmt.current_assets_mn ?? stmt.currentAssetsMn);
+      const currentLiabilitiesMn = numOrNull(stmt.current_liabilities_mn ?? stmt.currentLiabilitiesMn);
+      const capexMn = numOrNull(stmt.capex_mn ?? stmt.capexMn);
+      const operatingCashFlowMn = numOrNull(stmt.operating_cash_flow_mn ?? stmt.operatingCashFlowMn);
+      const freeCashFlowMn = numOrNull(stmt.free_cash_flow_mn ?? stmt.freeCashFlowMn);
+      const debtToEquity = numOrNull(stmt.debt_to_equity ?? stmt.debtToEquity);
+      const currentRatio = numOrNull(stmt.current_ratio ?? stmt.currentRatio);
+
+      if (dps !== null && dps < 0) {
+        errors.push(`FY${yr} DPS cannot be negative (৳${dps})`);
+      }
+      if (bonusPct !== null && bonusPct < 0) {
+        errors.push(`FY${yr} Bonus % cannot be negative (${bonusPct}%)`);
+      }
+      if (shortLoan !== null && shortLoan < 0) {
+        errors.push(`FY${yr} Short-term loan cannot be negative (${shortLoan} mn)`);
+      }
+      if (longLoan !== null && longLoan < 0) {
+        errors.push(`FY${yr} Long-term loan cannot be negative (${longLoan} mn)`);
+      }
+      if (revenueMn !== null && revenueMn < 0) {
+        errors.push(`FY${yr} Revenue cannot be negative (${revenueMn} mn)`);
+      }
+      if (revenueMn !== null && grossProfitMn !== null && grossProfitMn > revenueMn) {
+        errors.push(`FY${yr} Gross profit (${grossProfitMn} mn) cannot exceed revenue (${revenueMn} mn)`);
+      }
+      if (totalAssetsMn !== null && totalAssetsMn < 0) {
+        errors.push(`FY${yr} Total assets cannot be negative (${totalAssetsMn} mn)`);
+      }
+      if (totalLiabilitiesMn !== null && totalLiabilitiesMn < 0) {
+        errors.push(`FY${yr} Total liabilities cannot be negative (${totalLiabilitiesMn} mn)`);
+      }
+      if (operatingCashFlowMn !== null && capexMn !== null && freeCashFlowMn !== null) {
+        const expectedFcf = parseFloat((operatingCashFlowMn - capexMn).toFixed(2));
+        if (Math.abs(freeCashFlowMn - expectedFcf) > 0.05) {
+          errors.push(`FY${yr} Free cash flow mismatch: ${freeCashFlowMn} vs expected ${expectedFcf} mn`);
+        }
+      }
+
       cleanStatements.push({
         symbol: symbol.toUpperCase().trim(),
         year: yr,
@@ -157,13 +214,30 @@ export class DataAuditor {
         period: stmt.period || 'Annual',
         eps,
         navps,
-        dps: numOrNull(stmt.dps),
-        bonus_pct: numOrNull(stmt.bonus_pct),
+        dps,
+        bonus_pct: bonusPct,
         roe,
         pe_ratio: numOrNull(stmt.pe_ratio),
         pb_ratio: numOrNull(stmt.pb_ratio),
         dividend_yield: numOrNull(stmt.dividend_yield),
         paid_up_capital_mn: numOrNull(stmt.paid_up_capital_mn),
+        net_income_mn: numOrNull(stmt.net_income_mn),
+        reserve_surplus_mn: numOrNull(stmt.reserve_surplus_mn),
+        oci_mn: numOrNull(stmt.oci_mn),
+        short_term_loan_mn: shortLoan,
+        long_term_loan_mn: longLoan,
+        revenue_mn: revenueMn,
+        gross_profit_mn: grossProfitMn,
+        operating_profit_mn: operatingProfitMn,
+        total_assets_mn: totalAssetsMn,
+        total_liabilities_mn: totalLiabilitiesMn,
+        current_assets_mn: currentAssetsMn,
+        current_liabilities_mn: currentLiabilitiesMn,
+        capex_mn: capexMn,
+        operating_cash_flow_mn: operatingCashFlowMn,
+        free_cash_flow_mn: freeCashFlowMn,
+        debt_to_equity: debtToEquity,
+        current_ratio: currentRatio,
         source: stmt.source || 'DSE_OFFICIAL'
       });
     }
@@ -247,10 +321,10 @@ export class DataAuditor {
     const advancing = numOrNull(snapshot.advancing);
     const declining = numOrNull(snapshot.declining);
     const unchanged = numOrNull(snapshot.unchanged);
-    // The exact hardcoded output of the deleted pipeline/src/builders/dsex_builder.js
-    // fabrication generator -- a permanent regression guard, see ARCHITECTURE.md.
+    // The exact hardcoded output of a since-deleted fabrication generator --
+    // a permanent regression guard, see ARCHITECTURE.md Known Incidents.
     if (advancing === 180 && declining === 140 && unchanged === 60) {
-      errors.push('Breadth matches the known dsex_builder.js fabrication signature (advancing=180, declining=140, unchanged=60)');
+      errors.push('Breadth matches a known fabrication signature (advancing=180, declining=140, unchanged=60)');
     }
 
     const cleaned = {
@@ -268,6 +342,46 @@ export class DataAuditor {
       errors,
       warnings,
       cleaned
+    };
+  }
+
+  /**
+   * Audit one DS30 index-level snapshot (the daily index value + day-over-day
+   * change server/index.js's DS30 index scraper produces). Separate from
+   * auditMarketBreadthSnapshot (that one is DSEX + breadth counts) because DS30
+   * is a different index with its own realistic range -- reusing DSEX's
+   * 500-20000 band would let a badly-parsed DS30 value (e.g. accidentally
+   * picking up the DSEX or Shariah series instead) through uncaught.
+   */
+  static auditDS30Snapshot(snapshot = {}) {
+    const errors = [];
+    const warnings = [];
+
+    const ds30Index = numOrNull(snapshot.ds30Index ?? snapshot.ds30_index);
+    if (ds30Index !== null && (ds30Index < DS30_INDEX_MIN || ds30Index > DS30_INDEX_MAX)) {
+      errors.push(`DS30 index out of realistic range: ${ds30Index}`);
+    }
+
+    const prevClose = numOrNull(snapshot.prevClose ?? snapshot.prev_close);
+    if (prevClose !== null && (prevClose < DS30_INDEX_MIN || prevClose > DS30_INDEX_MAX)) {
+      errors.push(`DS30 previous close out of realistic range: ${prevClose}`);
+    }
+
+    // changePercent is always derived from ds30Index/prevClose below, never
+    // trusted as an independently-supplied field -- a scraper bug in one place
+    // can't silently disagree with the two real numbers it was computed from.
+    const changePercent = (ds30Index !== null && prevClose !== null && prevClose > 0)
+      ? Number((((ds30Index - prevClose) / prevClose) * 100).toFixed(2))
+      : null;
+    if (changePercent !== null && Math.abs(changePercent) > 15) {
+      warnings.push(`DS30 day-over-day change looks unusually large: ${changePercent}% (not blocked, flagged for review)`);
+    }
+
+    return {
+      passed: errors.length === 0,
+      errors,
+      warnings,
+      cleaned: { ds30Index, prevClose, changePercent }
     };
   }
 
@@ -335,11 +449,84 @@ export class DataAuditor {
     }
     if (errors.length === 0) {
       const sum = fields.reduce((acc, f) => acc + Number(snapshot[f]), 0);
-      if (Math.abs(sum - 100) > 1.0) {
+      if (Math.abs(sum - 100) > SHAREHOLDING_SUM_TOLERANCE_PCT) {
         errors.push(`${symbol}: shareholding categories sum to ${sum.toFixed(2)}%, expected ~100%`);
       }
     }
 
     return { passed: errors.length === 0, errors, warnings };
+  }
+
+  /**
+   * Audit one block-market (institutional) transaction row before it reaches
+   * block_market_history. Previously this table had no DataAuditor gate at
+   * all -- scrape_current_block_market.js wrote parsed rows straight to the
+   * DB, violating the "every scraper audits its output before it reaches a
+   * DB write" rule (ARCHITECTURE.md). Mirrors auditPriceHistory's shape
+   * (per-symbol date validity, duplicate-date filtering) plus the
+   * min_price<=max_price identity a block trade must satisfy.
+   */
+  static auditBlockMarketRecord(symbol, records = []) {
+    const errors = [];
+    const warnings = [];
+    const cleanRecords = [];
+    const seenDates = new Set();
+
+    if (!records || !Array.isArray(records) || records.length === 0) {
+      return { passed: false, symbol, errors: ['Block market records array is empty'], warnings, cleaned: [] };
+    }
+
+    for (const r of records) {
+      const dStr = String(r.date || r.trade_date || '').slice(0, 10);
+      if (!dStr || !/^\d{4}-\d{2}-\d{2}$/.test(dStr)) {
+        errors.push(`Invalid date format: ${dStr}`);
+        continue;
+      }
+      if (seenDates.has(dStr)) {
+        warnings.push(`Duplicate block-market record for ${dStr} filtered out`);
+        continue;
+      }
+      seenDates.add(dStr);
+
+      const quantity = positiveNumOrNull(r.quantity);
+      if (quantity === null) {
+        errors.push(`${dStr}: quantity must be a positive number, got ${r.quantity}`);
+        continue;
+      }
+
+      const valueMn = numOrNull(r.value_mn);
+      if (valueMn !== null && valueMn <= 0) {
+        errors.push(`${dStr}: value_mn must be positive if present, got ${valueMn}`);
+        continue;
+      }
+
+      const minPrice = numOrNull(r.min_price);
+      const maxPrice = numOrNull(r.max_price);
+      if (minPrice !== null && maxPrice !== null && minPrice > maxPrice) {
+        errors.push(`${dStr}: min_price (${minPrice}) cannot exceed max_price (${maxPrice})`);
+        continue;
+      }
+
+      cleanRecords.push({
+        symbol: symbol.toUpperCase().trim(),
+        date: dStr,
+        trades: numOrNull(r.trades),
+        quantity,
+        value_mn: valueMn,
+        min_price: minPrice,
+        max_price: maxPrice,
+        source: r.source || 'LANKABD'
+      });
+    }
+
+    return {
+      passed: errors.length === 0,
+      symbol,
+      totalInput: records.length,
+      validRecords: cleanRecords.length,
+      errors,
+      warnings,
+      cleaned: cleanRecords
+    };
   }
 }

@@ -1,10 +1,11 @@
 /**
- * Static source-code fabrication audit for Backend (server/), Pipeline
- * (pipeline/src/), and the shared foundation (shared/) both depend on. Complements
- * the data-level auditors (shared/data_auditor.js for staging/main-DB records,
- * server/audit/db_auditor.js for the main DB as a whole) by catching bad patterns
- * in the CODE before they ever produce bad data -- see ARCHITECTURE.md for the
- * full rationale, including the canonical null/number rule this enforces:
+ * Static source-code fabrication audit for the backend (server/) and its
+ * shared foundation (shared/). Complements the data-level auditors
+ * (shared/data_auditor.js for record-level validation,
+ * server/auditors/audit_main_database.js for the main DB as a whole) by
+ * catching bad patterns in the CODE before they ever produce bad data -- see
+ * ARCHITECTURE.md for the full rationale, including the canonical null/number
+ * rule this enforces:
  *   1. Never `||` for a numeric fallback -- always `??` (or a shared/safe_number.js
  *      helper). `||` treats a real 0 the same as missing data.
  *   2. The fallback is `null`, never a fabricated 0/constant/other field.
@@ -37,14 +38,14 @@ const REPO_ROOT = path.join(__dirname, '..');
 // catch) sat undetected for as long as it did specifically because this
 // directory was never scanned, despite scripts/ writing files the API serves
 // directly (/api/download/job1-price-history).
-const SCAN_DIRS = ['server', 'pipeline/src', 'shared', 'scripts'];
+const SCAN_DIRS = ['server', 'shared', 'scripts'];
 
 // This tool's own source (and its sibling data-auditors/canonical helpers)
 // legitimately contains the pattern strings being searched for -- exclude audit
 // tooling and the canonical implementations themselves from the scan.
 const EXCLUDE_FILES = [
   'shared/code_audit.js',
-  'server/audit/db_auditor.js',
+  'server/auditors/audit_main_database.js',
   'shared/data_auditor.js',
   'shared/safe_number.js',
   'shared/test_suite.js',
@@ -82,6 +83,106 @@ const WARNING_PATTERNS = [
   // this regex can.
   { name: '`!== undefined` without `!== null` -- may silently let null through (Number(null) is 0)', regex: /!==\s*undefined\b/g, mustNotMatch: /!==\s*null\b/ },
 ];
+
+// Catches the exact class of bug found 2026-09-01: scrapeLankaBDDividendArchive()
+// had no isScraperEnabled() gate at all (no registry key, no check in its own
+// body) and ran unconditionally on every default CLI invocation of its file,
+// duplicating ~13,000 rows before anyone noticed. The existing "every
+// registered scraper defaults off" test (shared/test_suite.js) can only see
+// scrapers that ARE registered -- it has no way to notice one that was never
+// added to the registry in the first place. This check closes that blind
+// spot from the other direction: every exported `scrape*`-named function
+// under server/scrapers/ must call isScraperEnabled( somewhere in its own
+// body (per ARCHITECTURE.md: "gated at its function entry point (not just at
+// one caller)"). A narrow, deliberately-named-convention check -- it only
+// looks at functions actually named scrape*, not every exported function --
+// to avoid false positives on unrelated helpers (fetchX, parseX, etc.).
+const SCRAPER_FN_REGEX = /export\s+(?:async\s+)?function\s+(scrape\w*)\s*\(/g;
+
+// Explicit, individually-justified exceptions -- shared low-level "fetch and
+// parse ONE thing" helpers that are deliberately NOT gated at their own entry
+// point because every one of their actual callers already is (verified by
+// tracing every call site, not assumed). Keeping this list short and named
+// (rather than loosening the check to a warning) means a genuinely new
+// ungated scraper -- the exact shape of the scrapeLankaBDDividendArchive
+// incident this check exists to catch -- still hard-fails CERTIFIED_PASSED
+// instead of being silently swallowed alongside these known-safe exceptions.
+// Adding to this list is a deliberate decision, same bar as adding to
+// shared/source_tiers.js -- verify every call site is gated before adding.
+const UNGATED_SCRAPER_HELPER_EXCEPTIONS = new Set([
+  // server/scrapers/scrape_historical_financial_statements.js -- called only
+  // from scrapeFundamentalsForAll() (gated: historical.fundamentals_scraper)
+  // and fillFundamentalsGap() (gated: historical.gap_scraper_fundamentals).
+  'scrapeCompanyFundamentals',
+  // server/scrapers/sources/ds30_index_scraper.js -- no DB write of its own;
+  // called only from dse_closing_scraper.js's runDailyClosingPricesScraper(),
+  // itself gated (server.closing_prices), which additionally re-checks
+  // isScraperEnabled('server.ds30_index') before calling this.
+  'scrapeDs30IndexLevel',
+  // server/scrapers/sources/dse_fundamentals_scraper.js -- called only from
+  // runDailyFundamentalsDeltaScraper() (gated: server.fundamentals_delta or
+  // server.fundamentals_weekly, whichever key it's invoked with).
+  'scrapeCompanyAuditedFinancials',
+]);
+
+// Finds a function's body by first skipping past its ENTIRE parameter list
+// via paren-depth counting (not just the first '('), then brace-matching from
+// the body's real opening '{'. Naively taking the first '{' after the
+// function name breaks on the very common `function f({ a = {} } = {})`
+// destructured-default-params shape -- it grabs a param's braces instead of
+// the body's, produces a truncated/wrong "body", and false-positives on a
+// scraper that's actually gated (confirmed live: this exact bug initially
+// misflagged scrapeBlockMarket/scrapeCompanyList/scrapePdfFinancialStatements/
+// scrapeFundamentalsForAll, all of which destructure an options param).
+function findFunctionBody(content, matchIndex, matchedText) {
+  const parenStart = content.indexOf('(', matchIndex + matchedText.length - 1);
+  if (parenStart === -1) return null;
+  let parenDepth = 0;
+  let closeParenIdx = -1;
+  for (let i = parenStart; i < content.length; i++) {
+    if (content[i] === '(') parenDepth++;
+    else if (content[i] === ')') {
+      parenDepth--;
+      if (parenDepth === 0) { closeParenIdx = i; break; }
+    }
+  }
+  if (closeParenIdx === -1) return null;
+
+  const braceStart = content.indexOf('{', closeParenIdx + 1);
+  if (braceStart === -1) return null;
+  let braceDepth = 0;
+  for (let i = braceStart; i < content.length; i++) {
+    if (content[i] === '{') braceDepth++;
+    else if (content[i] === '}') {
+      braceDepth--;
+      if (braceDepth === 0) return content.slice(braceStart, i + 1);
+    }
+  }
+  return null;
+}
+
+function checkUngatedScrapers(absPath, relPath, content) {
+  if (!relPath.startsWith('server' + path.sep + 'scrapers' + path.sep) && relPath !== path.join('server', 'scrapers')) return [];
+  const errors = [];
+  SCRAPER_FN_REGEX.lastIndex = 0;
+  let match;
+  while ((match = SCRAPER_FN_REGEX.exec(content))) {
+    const fnName = match[1];
+    if (UNGATED_SCRAPER_HELPER_EXCEPTIONS.has(fnName)) continue;
+    const body = findFunctionBody(content, match.index, match[0]);
+    if (body === null) continue; // unbalanced braces -- don't guess, skip rather than false-positive
+    if (!body.includes('isScraperEnabled(')) {
+      const line = content.slice(0, match.index).split('\n').length;
+      errors.push({
+        file: relPath,
+        line,
+        pattern: 'Ungated scraper (no isScraperEnabled() check in function body)',
+        text: `export function ${fnName}(...) -- add an isScraperEnabled('<registry.key>') guard at the top of this function, matching every other scrape* function in this codebase`,
+      });
+    }
+  }
+  return errors;
+}
 
 function walk(dir, files = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -124,12 +225,14 @@ function scanFile(absPath) {
     }
   });
 
+  errors.push(...checkUngatedScrapers(absPath, relPath, content));
+
   return { errors, warnings };
 }
 
 export function auditCode() {
   console.log('\n======================================================');
-  console.log('   BACKEND + PIPELINE SOURCE CODE FABRICATION AUDIT');
+  console.log('   BACKEND SOURCE CODE FABRICATION AUDIT');
   console.log(`   Scanning: ${SCAN_DIRS.join(', ')}`);
   console.log('======================================================\n');
 
@@ -177,5 +280,25 @@ export function auditCode() {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const result = auditCode();
+  // Previously this never persisted to audit_reports at all -- ARCHITECTURE.md
+  // claimed `npm run audit:all` "persist[s] certified reports to audit_reports",
+  // true only for the audit:main-db half. Kept out of the exported auditCode()
+  // itself (a pure, synchronous, DB-independent function other future callers
+  // may want to reuse without a DB side effect) and done only at this CLI
+  // entry point instead.
+  try {
+    const { initDB, saveMainDBAuditReport } = await import('../server/db.js');
+    await initDB();
+    await saveMainDBAuditReport({
+      targetEntity: 'STATIC_CODE_FABRICATION_AUDIT',
+      recordsAudited: result.filesScanned,
+      errorsCount: result.errors.length,
+      warningsCount: result.warnings.length,
+      status: result.status,
+      reportJson: { filesScanned: result.filesScanned, errors: result.errors, warnings: result.warnings }
+    });
+  } catch (err) {
+    console.error('[AUDITOR] Failed to save static code audit report:', err.message);
+  }
   process.exit(result.passed ? 0 : 1);
 }
